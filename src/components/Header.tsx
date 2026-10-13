@@ -11,8 +11,12 @@ import {
   Settings,
   Flame,
   FileText,
+  Cloud,
+  Paperclip,
+  Plus,
 } from "lucide-react";
 import { sound } from "../utils/audio";
+import { UserAccountProfile } from "../types";
 
 interface HeaderProps {
   activeTab: "catalog" | "game" | "creator" | "characters" | "saves";
@@ -21,6 +25,12 @@ interface HeaderProps {
   onOpenSettings: () => void;
   onOpenExportImport?: () => void;
   onOpenInternetFinder?: () => void;
+  onOpenCloudSync?: () => void;
+  onOpenAccountModal?: () => void;
+  currentUser?: UserAccountProfile | null;
+  onOpenWorldMap?: () => void;
+  onOpenMediaAttachment?: () => void;
+  attachedMediaCount?: number;
   isAiEnabled: boolean;
   soundEnabled: boolean;
   setSoundEnabled: (val: boolean) => void;
@@ -33,6 +43,12 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenSettings,
   onOpenExportImport,
   onOpenInternetFinder,
+  onOpenCloudSync,
+  onOpenAccountModal,
+  currentUser,
+  onOpenWorldMap,
+  onOpenMediaAttachment,
+  attachedMediaCount = 0,
   isAiEnabled,
   soundEnabled,
   setSoundEnabled,
@@ -212,6 +228,100 @@ export const Header: React.FC<HeaderProps> = ({
           >
             {soundEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
           </button>
+
+          {/* Media Attachments & File Lab Button */}
+          {onOpenMediaAttachment && (
+            <button
+              id="btn-header-media-attachments"
+              onClick={() => {
+                sound.playClick();
+                onOpenMediaAttachment();
+              }}
+              aria-label="Прикрепить файлы (+)"
+              className="p-2 sm:px-2.5 sm:py-1.5 rounded-lg bg-purple-950/70 hover:bg-purple-900 border border-purple-850 hover:border-purple-600 text-purple-200 text-xs font-semibold flex items-center gap-1.5 transition-all shadow-sm"
+              title="Медиатека & Прикрепление файлов (+): фото поз/внешности, аудио голоса персонажей, видео, сценарии, тексты"
+            >
+              <Paperclip className="w-4 h-4 text-purple-400" />
+              <span className="hidden xl:inline">+ Файлы</span>
+              {attachedMediaCount > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full bg-purple-600 text-[10px] text-white font-mono font-bold">
+                  {attachedMediaCount}
+                </span>
+              )}
+            </button>
+          )}
+
+          {/* Interactive World Map Button */}
+          {hasActiveGame && onOpenWorldMap && (
+            <button
+              id="btn-header-world-map"
+              onClick={() => {
+                sound.playClick();
+                onOpenWorldMap();
+              }}
+              aria-label="Карта мира D3"
+              className="px-2.5 py-1.5 rounded-xl bg-gradient-to-r from-amber-950/70 to-purple-950/70 hover:from-amber-900 hover:to-purple-900 border border-amber-600/40 text-amber-300 text-xs font-semibold flex items-center gap-1.5 transition-all shadow-sm"
+              title="Открыть Интерактивную Карту Мира (D3: канон, пройденный путь и будущие развилки)"
+            >
+              <span>🗺️</span>
+              <span className="hidden sm:inline">Карта мира</span>
+            </button>
+          )}
+
+          {/* User Account & Universal Sync Widget */}
+          {onOpenAccountModal && (
+            <button
+              id="btn-header-user-account"
+              onClick={() => {
+                sound.playClick();
+                onOpenAccountModal();
+              }}
+              className={`flex items-center gap-2 px-2.5 py-1.5 rounded-xl border text-xs font-semibold transition-all shadow-sm ${
+                currentUser
+                  ? "bg-purple-950/80 hover:bg-purple-900/80 border-purple-600/60 text-purple-200"
+                  : "bg-neutral-900 hover:bg-neutral-850 border-neutral-800 text-neutral-300 hover:text-white"
+              }`}
+              title={
+                currentUser
+                  ? `Учётная запись: ${currentUser.username} (${currentUser.email}). Синхронизация активна.`
+                  : "Регистрация и вход: сквозная синхронизация со смартфонами и ПК"
+              }
+            >
+              {currentUser ? (
+                <>
+                  <div className="w-5 h-5 rounded-full bg-gradient-to-tr from-purple-500 to-amber-500 p-0.5 flex items-center justify-center shrink-0">
+                    <div className="w-full h-full bg-neutral-950 rounded-full flex items-center justify-center text-[10px] font-bold text-purple-300">
+                      {currentUser.username.slice(0, 1).toUpperCase()}
+                    </div>
+                  </div>
+                  <span className="hidden md:inline max-w-[100px] truncate">{currentUser.username}</span>
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" title="В сети • Синхронизировано" />
+                </>
+              ) : (
+                <>
+                  <Cloud className="w-4 h-4 text-purple-400 shrink-0" />
+                  <span className="hidden md:inline">Учётная запись</span>
+                  <span className="md:hidden">Вход</span>
+                </>
+              )}
+            </button>
+          )}
+
+          {/* Cloud Sync & Cross-Device Button */}
+          {onOpenCloudSync && (
+            <button
+              id="btn-header-cloud-sync"
+              onClick={() => {
+                sound.playClick();
+                onOpenCloudSync();
+              }}
+              aria-label="Облако и Синхронизация"
+              className="p-2 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-purple-400 hover:text-purple-200 transition-colors"
+              title="Облако & Перенос на телефон (Синхронизация)"
+            >
+              <Cloud className="w-4 h-4" />
+            </button>
+          )}
 
           {/* Export / Import Modal Trigger */}
           {onOpenExportImport && (

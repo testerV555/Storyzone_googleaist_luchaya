@@ -7,6 +7,7 @@ import {
   Character,
   UniverseSetting,
   LorebookEntry,
+  StoryChatMessage,
 } from "../types";
 import { StoryAiChatView } from "./StoryAiChatView";
 import { X, Bot } from "lucide-react";
@@ -32,6 +33,15 @@ interface StoryAiChatDrawerProps {
   onUpdateUniverseSetting?: (newSetting: UniverseSetting) => void;
   onAddLorebookEntry?: (entry: LorebookEntry) => void;
   onOpenUniverseModal?: () => void;
+  onUpdateChatHistory?: (messages: StoryChatMessage[]) => void;
+  onOpenCloudSync?: () => void;
+  onOpenMediaAttachment?: () => void;
+  onToggleAuthorDictateMode?: (enabled: boolean) => void;
+  onToggleStrictActionFidelity?: (enabled: boolean) => void;
+  onToggleProportionalActionScaling?: (enabled: boolean) => void;
+  onAddCoAuthorAgreement?: (agreement: any) => void;
+  onRemoveCoAuthorAgreement?: (id: string) => void;
+  onUpdateCoAuthorAgreement?: (agreement: any) => void;
 }
 
 export const StoryAiChatDrawer: React.FC<StoryAiChatDrawerProps> = ({
@@ -54,6 +64,15 @@ export const StoryAiChatDrawer: React.FC<StoryAiChatDrawerProps> = ({
   onUpdateUniverseSetting,
   onAddLorebookEntry,
   onOpenUniverseModal,
+  onUpdateChatHistory,
+  onOpenCloudSync,
+  onOpenMediaAttachment,
+  onToggleAuthorDictateMode,
+  onToggleStrictActionFidelity,
+  onToggleProportionalActionScaling,
+  onAddCoAuthorAgreement,
+  onRemoveCoAuthorAgreement,
+  onUpdateCoAuthorAgreement,
 }) => {
   if (!isOpen) return null;
 
@@ -101,6 +120,15 @@ export const StoryAiChatDrawer: React.FC<StoryAiChatDrawerProps> = ({
             onUpdateUniverseSetting={onUpdateUniverseSetting}
             onAddLorebookEntry={onAddLorebookEntry}
             onOpenUniverseModal={onOpenUniverseModal}
+            onUpdateChatHistory={onUpdateChatHistory}
+            onOpenCloudSync={onOpenCloudSync}
+            onOpenMediaAttachment={onOpenMediaAttachment}
+            onToggleAuthorDictateMode={onToggleAuthorDictateMode}
+            onToggleStrictActionFidelity={onToggleStrictActionFidelity}
+            onToggleProportionalActionScaling={onToggleProportionalActionScaling}
+            onAddCoAuthorAgreement={onAddCoAuthorAgreement}
+            onRemoveCoAuthorAgreement={onRemoveCoAuthorAgreement}
+            onUpdateCoAuthorAgreement={onUpdateCoAuthorAgreement}
           />
         </div>
       </div>

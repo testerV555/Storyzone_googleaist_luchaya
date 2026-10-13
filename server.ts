@@ -1,5 +1,7 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
+import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
@@ -9,7 +11,59 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "35mb" }));
+
+// Persistent Cloud Sync File Storage
+const CLOUD_STORAGE_FILE = path.join(process.cwd(), "data", "cloud_sync_storage.json");
+
+interface CloudAccountRecord {
+  accountKey: string;
+  shortCode: string;
+  lastSyncedAt: number;
+  stories: Record<string, any>;
+}
+
+interface CloudStorageDb {
+  accounts: Record<string, CloudAccountRecord>;
+}
+
+function loadCloudStorageDb(): CloudStorageDb {
+  try {
+    if (fs.existsSync(CLOUD_STORAGE_FILE)) {
+      const data = fs.readFileSync(CLOUD_STORAGE_FILE, "utf-8");
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed.accounts === "object") {
+        return parsed;
+      }
+    }
+  } catch (e) {
+    console.warn("Could not read cloud storage DB file, initializing empty:", e);
+  }
+  return { accounts: {} };
+}
+
+function saveCloudStorageDb(db: CloudStorageDb) {
+  try {
+    const dir = path.dirname(CLOUD_STORAGE_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(CLOUD_STORAGE_FILE, JSON.stringify(db, null, 2), "utf-8");
+  } catch (e) {
+    console.error("Failed to write cloud storage DB file:", e);
+  }
+}
+
+// Helper: generate 6-character memorable sync PIN (e.g. "SZ-9284")
+function generateShortSyncCode(seedStr: string): string {
+  let hash = 0;
+  for (let i = 0; i < seedStr.length; i++) {
+    hash = (hash << 5) - hash + seedStr.charCodeAt(i);
+    hash |= 0;
+  }
+  const num = Math.abs(hash) % 9000 + 1000;
+  return `SZ-${num}`;
+}
 
 // Helper to get GoogleGenAI client with fallback to custom user key
 function getGeminiClient(customKey?: string): GoogleGenAI | null {
@@ -61,13 +115,10 @@ async function runGeminiWithSearchFallback(
     throw new Error("NO_API_KEY");
   }
 
-  // When search grounding is enabled, prioritize gemini-3.8-flash as required for googleSearch
+  // Only gemini-3.8-flash supports googleSearch tool. Non-search models shouldn't be called with tools
   const modelsToTry = useSearchGrounding
     ? [
         "gemini-3.8-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-flash-latest",
       ]
     : [
         "gemini-3.5-flash-lite",
@@ -75,7 +126,7 @@ async function runGeminiWithSearchFallback(
         "gemini-3.8-flash",
         "gemini-flash-latest",
       ];
-  const TIMEOUT_MS = 25000; // Generous timeout for deep literary scene generation and long actions
+  const TIMEOUT_MS = useSearchGrounding ? 12000 : 15000; // 12-15s timeout per attempt to eliminate UI freezes
 
   for (const modelName of modelsToTry) {
     try {
@@ -149,7 +200,7 @@ async function runGeminiWithSearchFallback(
       // If failed with responseMimeType + tools combination, retry this model once with explicit JSON instructions in prompt
       if (useSearchGrounding && jsonMode && (err?.message?.includes?.("mime") || err?.message?.includes?.("tool") || err?.status === 400)) {
         try {
-          const res = (await ai.models.generateContent({
+          const retryGenPromise = ai.models.generateContent({
             model: modelName,
             contents: promptOrContents,
             config: {
@@ -158,7 +209,11 @@ async function runGeminiWithSearchFallback(
                 (systemInstruction || "") +
                 "\nВАЖНО: Верни ответ СТРОГО в виде валидного JSON-объекта, без какого-либо вступительного или заключительного текста.",
             },
-          })) as any;
+          });
+          const retryTimeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("Retry timeout")), 15000)
+          );
+          const res = (await Promise.race([retryGenPromise, retryTimeoutPromise])) as any;
 
           if (res && res.text) {
             let text = res.text.trim();
@@ -603,6 +658,695 @@ app.post("/api/story/fandom-premise", async (req, res) => {
   }
 });
 
+// ==============================================================================
+// 4.5. CONTEXT SUMMARIZATION SERVICE: NARRATIVE CONTINUITY & CHARACTER CONSISTENCY
+// ==============================================================================
+interface ContextSummarizationParams {
+  storyTitle: string;
+  genre: string;
+  currentScene: string;
+  characters: any[];
+  history: any[];
+  memoryChapters?: any[];
+  lorebook?: any[];
+  action?: string;
+  narrativeStyle?: string;
+  customKey?: string;
+}
+
+async function generateNarrativeContextSummary(params: ContextSummarizationParams): Promise<string> {
+  const safeCharacters = Array.isArray(params.characters) ? params.characters : [];
+  const safeHistory = Array.isArray(params.history) ? params.history : [];
+
+  if (safeHistory.length === 0) {
+    const charsList = safeCharacters
+      .map((c: any) => `${c.name} (${c.role || "спутник"}): отношение ${c.affinity || 50}%`)
+      .join("; ");
+    return `[ОПЕРАТИВНЫЙ СЦЕНАРНЫЙ КОНТЕКСТ (NARRATIVE CONTEXT)]
+• Активный конфликт и цель: Начальная завязка истории «${params.storyTitle || "Повесть"}». Герой делает первые ключевые шаги.
+• Психологические якоря спутников: ${charsList || "Герой странствует один."} Характеры стабильны, доверие на базовом уровне.
+• Причинно-следственная цепь: Пролог. Прошлых ошибок или разногласий пока нет.
+• Физические якоря обстановки: Исходная локация пролога, полное здоровье, стартовые вещи.
+• Запрет амнезии: Строго помнить каждое принятое решение с первого же шага.`;
+  }
+
+  const recentSteps = safeHistory.slice(-4);
+  const stepsSummary = recentSteps
+    .map(
+      (s: any) =>
+        `• Шаг ${s.stepNumber}: Игрок выбрал/написал: «${s.action || "Ход"}». Итог сцены: ${s.sceneText?.slice(0, 180).trim()}...`
+    )
+    .join("\n");
+
+  const charsSummary = safeCharacters
+    .map(
+      (c: any) =>
+        `• ${c.name} (${c.role}): Отношение ${c.affinity || 50}%. Черты: ${(c.traits || []).join(", ") || "—"}. Статус: ${c.currentStatus || "в отряде"}.`
+    )
+    .join("\n");
+
+  const prompt = `Ты — Строгий Режиссерский Аналитик Непрерывности (Script Continuity Supervisor).
+Твоя задача — составить сверхконцентрированный "Narrative Context" для предотвращения амнезии ИИ, дрейфа характеров (memory drift) и рассинхронизации сюжета.
+
+ИСТОРИЯ: "${params.storyTitle}" (Жанр: ${params.genre})
+СВЕЖИЕ ШАГИ ИСТОРИИ:
+${stepsSummary}
+
+ТЕКУЩАЯ СЦЕНА:
+${params.currentScene.slice(0, 350)}
+
+ДЕЙСТВИЕ ГЕРОЯ СЕЙЧАС:
+"${params.action || "Продолжение"}"
+
+ДЕЙСТВУЮЩИЕ СПУТНИКИ:
+${charsSummary || "Спутников нет"}
+
+Сформируй лаконичный, плотный аналитический срез (ровно 5 коротких пунктов):
+1. АКТИВНЫЙ КОНФЛИКТ И СТАВКИ: В чем конкретно непосредственная опасность, напряжение и текущая цель этой секунды.
+2. ПСИХОЛОГИЧЕСКИЕ ЯКОРЯ СПУТНИКОВ: Эмоциональное состояние каждого спутника, их отношение к недавним поступкам героя, что они сейчас чувствуют и о чем помнят.
+3. ПРИЧИННО-СЛЕДСТВЕННАЯ ЦЕПЬ: Неразрывный мост от предыдущего шага к текущему действию.
+4. ФИЗИЧЕСКИЕ И ТАКТИЧЕСКИЕ ЯКОРЯ: Точное окружение, ранения, звуки, свет, оружие/предметы в руках, исключающие внезапную телепортацию.
+5. НЕЗАВЕРШЕННЫЕ ОБЕЩАНИЯ И УГРОЗЫ: Клятвы, долги, ожидаемые опасности.`;
+
+  try {
+    const ai = getGeminiClient(params.customKey);
+    if (!ai) throw new Error("No client");
+
+    const genPromise = ai.models.generateContent({
+      model: "gemini-3.8-flash",
+      contents: prompt,
+      config: {
+        systemInstruction:
+          "Ты — литературный супервайзер непрерывности. Пиши емко, строго, на русском языке, без вступительных и заключительных фраз.",
+      },
+    });
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Timeout")), 7000)
+    );
+
+    const res = (await Promise.race([genPromise, timeoutPromise])) as any;
+    if (res && res.text) {
+      return res.text.trim();
+    }
+  } catch (err) {
+    console.warn("Context summarization fast procedural fallback used:", (err as any)?.message);
+  }
+
+  // Fast procedural fallback
+  const lastStep = recentSteps[recentSteps.length - 1];
+  return `[ОПЕРАТИВНЫЙ СЦЕНАРНЫЙ КОНТЕКСТ (NARRATIVE CONTEXT)]
+• Активный конфликт и цель: Непосредственное разрешение действия «${params.action || "Продолжение"}».
+• Психология и якоря спутников: ${safeCharacters.map((c: any) => `${c.name} (${c.affinity || 50}%)`).join(", ") || "Один"}. Сохраняют свои голоса, помнят прошлые поступки героя.
+• Причинно-следственная цепь: Вытекает напрямую из шага #${lastStep?.stepNumber || 1} («${lastStep?.action || "Предыдущий ход"}»).
+• Физические якоря: Сохранять целостность сцены, положения персонажей, освещения и звуков без временных скачков.
+• Запрет амнезии: Действие обязано органично развивать текущий момент без сброса накопленного багажа отношений.`;
+}
+
+// Endpoint: Explicit Narrative Context Summarization on-demand
+app.post("/api/story/narrative-context", async (req, res) => {
+  try {
+    const { storyTitle, genre, currentScene, characters, history, memoryChapters, lorebook, action, customKey } = req.body;
+    const summary = await generateNarrativeContextSummary({
+      storyTitle: storyTitle || "История",
+      genre: genre || "Фэнтези",
+      currentScene: currentScene || "",
+      characters: characters || [],
+      history: history || [],
+      memoryChapters: memoryChapters || [],
+      lorebook: lorebook || [],
+      action: action || "Анализ контекста",
+      customKey,
+    });
+    res.json({ narrativeContextSummary: summary });
+  } catch (e: any) {
+    console.error("Narrative context error:", e);
+    res.status(500).json({ error: "Failed to generate context summary" });
+  }
+});
+
+// ==============================================================================
+// 4.6. CLOUD ACCOUNT & CROSS-DEVICE STORY SYNCHRONIZATION
+// ==============================================================================
+app.post("/api/cloud-sync/save", async (req, res) => {
+  try {
+    const {
+      accountKey: rawAccountKey,
+      storyId,
+      storyTitle,
+      storyGenre,
+      gameState,
+      saves,
+      chatHistory,
+      deviceType,
+    } = req.body;
+
+    if (!gameState || !storyId) {
+      return res.status(400).json({ error: "Missing storyId or gameState" });
+    }
+
+    const accountKey = (rawAccountKey || "default_user@storyzone.app").trim().toLowerCase();
+    const shortCode = generateShortSyncCode(accountKey);
+    const db = loadCloudStorageDb();
+
+    if (!db.accounts[accountKey]) {
+      db.accounts[accountKey] = {
+        accountKey,
+        shortCode,
+        lastSyncedAt: Date.now(),
+        stories: {},
+      };
+    }
+
+    const storyPayload = {
+      storyId,
+      storyTitle: storyTitle || gameState.story?.title || "Повесть",
+      storyGenre: storyGenre || gameState.story?.genre || "Фэнтези",
+      gameState,
+      saves: Array.isArray(saves) ? saves : [],
+      chatHistory: Array.isArray(chatHistory) ? chatHistory : (gameState.chatHistory || []),
+      syncedAt: Date.now(),
+      deviceType: deviceType || "Web",
+    };
+
+    db.accounts[accountKey].stories[storyId] = storyPayload;
+    db.accounts[accountKey].lastSyncedAt = Date.now();
+    db.accounts[accountKey].shortCode = shortCode;
+
+    saveCloudStorageDb(db);
+
+    res.json({
+      success: true,
+      accountKey,
+      shortCode,
+      storyId,
+      syncedAt: storyPayload.syncedAt,
+      storiesCount: Object.keys(db.accounts[accountKey].stories).length,
+      message: `История «${storyPayload.storyTitle}» успешно сохранена в облаке StoryZone для всех устройств!`,
+    });
+  } catch (err: any) {
+    console.error("Cloud sync save error:", err);
+    res.status(500).json({ error: "Failed to save to cloud storage" });
+  }
+});
+
+app.get("/api/cloud-sync/load", async (req, res) => {
+  try {
+    const rawKey = (req.query.accountKey as string || "").trim().toLowerCase();
+    const shortCode = (req.query.shortCode as string || "").trim().toUpperCase();
+    const targetStoryId = req.query.storyId as string | undefined;
+
+    const db = loadCloudStorageDb();
+
+    // Find account by email or short sync code
+    let foundAccount: CloudAccountRecord | null = null;
+    if (rawKey && db.accounts[rawKey]) {
+      foundAccount = db.accounts[rawKey];
+    } else if (shortCode) {
+      const match = Object.values(db.accounts).find((a) => a.shortCode.toUpperCase() === shortCode);
+      if (match) foundAccount = match;
+    }
+
+    if (!foundAccount) {
+      return res.status(404).json({
+        error: "ACCOUNT_NOT_FOUND",
+        message: "Аккаунт или код синхронизации не найден в облаке.",
+      });
+    }
+
+    const storyIds = Object.keys(foundAccount.stories);
+    if (storyIds.length === 0) {
+      return res.status(404).json({
+        error: "NO_STORIES",
+        message: "В данном аккаунте пока нет сохраненных историй.",
+      });
+    }
+
+    const selectedStoryId = targetStoryId && foundAccount.stories[targetStoryId]
+      ? targetStoryId
+      : storyIds[storyIds.length - 1]; // Latest story by default
+
+    const storyPayload = foundAccount.stories[selectedStoryId];
+
+    res.json({
+      success: true,
+      accountKey: foundAccount.accountKey,
+      shortCode: foundAccount.shortCode,
+      lastSyncedAt: foundAccount.lastSyncedAt,
+      storyPayload,
+      allStories: storyIds.map((id) => ({
+        storyId: id,
+        storyTitle: foundAccount!.stories[id].storyTitle,
+        storyGenre: foundAccount!.stories[id].storyGenre,
+        syncedAt: foundAccount!.stories[id].syncedAt,
+        stepCount: foundAccount!.stories[id].gameState?.stepCount || 1,
+      })),
+    });
+  } catch (err: any) {
+    console.error("Cloud sync load error:", err);
+    res.status(500).json({ error: "Failed to load from cloud storage" });
+  }
+});
+
+app.get("/api/cloud-sync/list", async (req, res) => {
+  try {
+    const rawKey = (req.query.accountKey as string || "").trim().toLowerCase();
+    const shortCode = (req.query.shortCode as string || "").trim().toUpperCase();
+
+    const db = loadCloudStorageDb();
+    let foundAccount: CloudAccountRecord | null = null;
+    if (rawKey && db.accounts[rawKey]) {
+      foundAccount = db.accounts[rawKey];
+    } else if (shortCode) {
+      const match = Object.values(db.accounts).find((a) => a.shortCode.toUpperCase() === shortCode);
+      if (match) foundAccount = match;
+    }
+
+    if (!foundAccount) {
+      return res.json({ accounts: [], stories: [] });
+    }
+
+    const storiesList = Object.values(foundAccount.stories).map((s: any) => ({
+      storyId: s.storyId,
+      storyTitle: s.storyTitle,
+      storyGenre: s.storyGenre,
+      syncedAt: s.syncedAt,
+      stepCount: s.gameState?.stepCount || 1,
+      deviceType: s.deviceType,
+    }));
+
+    res.json({
+      accountKey: foundAccount.accountKey,
+      shortCode: foundAccount.shortCode,
+      lastSyncedAt: foundAccount.lastSyncedAt,
+      stories: storiesList,
+    });
+  } catch (err: any) {
+    console.error("Cloud sync list error:", err);
+    res.status(500).json({ error: "Failed to list cloud stories" });
+  }
+});
+
+// ==============================================================================
+// 4.7. UNIVERSAL USER ACCOUNT & AUTOMATIC CROSS-DEVICE CLOUD SYNCHRONIZATION
+// (ПК, Смартфоны, Планшеты: сохранение всего прогресса, соавтора, глав, настроек)
+// ==============================================================================
+const USER_ACCOUNTS_FILE = path.join(process.cwd(), "data", "storyzone_user_accounts.json");
+
+interface StoryZoneUserAccount {
+  id: string;
+  username: string;
+  email: string;
+  passwordHash: string;
+  pinCode: string;
+  createdAt: number;
+  lastLoginAt: number;
+  lastSyncedAt: number;
+  devices: { deviceId: string; deviceName: string; lastSeen: number }[];
+  snapshot: {
+    activeGameState: any;
+    saves: any[];
+    customStories: any[];
+    chatHistories: Record<string, any[]>;
+    settings: any;
+    syncedAt: number;
+    stepCount?: number;
+    storyTitle?: string;
+  };
+}
+
+interface AccountsDb {
+  users: Record<string, StoryZoneUserAccount>; // keyed by lowercased email
+}
+
+function hashPassword(pwd: string): string {
+  return crypto.createHash("sha256").update(pwd + "_storyzone_salt").digest("hex");
+}
+
+function loadUserAccountsDb(): AccountsDb {
+  try {
+    if (fs.existsSync(USER_ACCOUNTS_FILE)) {
+      const data = fs.readFileSync(USER_ACCOUNTS_FILE, "utf-8");
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed.users === "object") {
+        return parsed;
+      }
+    }
+  } catch (e) {
+    console.warn("Could not read user accounts DB, creating fresh:", e);
+  }
+  return { users: {} };
+}
+
+function saveUserAccountsDb(db: AccountsDb) {
+  try {
+    const dir = path.dirname(USER_ACCOUNTS_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(USER_ACCOUNTS_FILE, JSON.stringify(db, null, 2), "utf-8");
+  } catch (e) {
+    console.error("Failed to write user accounts DB:", e);
+  }
+}
+
+// 1. User Registration with Immediate Full Progress Cloud Sync
+app.post("/api/account/register", async (req, res) => {
+  try {
+    const { username, email, password, initialSnapshot, deviceName, deviceId } = req.body;
+
+    if (!email || typeof email !== "string" || !email.includes("@")) {
+      return res.status(400).json({ error: "Пожалуйста, введите корректный адрес электронной почты." });
+    }
+    if (!password || typeof password !== "string" || password.trim().length < 4) {
+      return res.status(400).json({ error: "Пароль должен содержать минимум 4 символа." });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanUsername = (username && typeof username === "string" && username.trim())
+      ? username.trim()
+      : cleanEmail.split("@")[0];
+
+    const db = loadUserAccountsDb();
+
+    if (db.users[cleanEmail]) {
+      return res.status(400).json({
+        error: "Аккаунт с таким email уже зарегистрирован. Пожалуйста, выполните вход.",
+      });
+    }
+
+    const pinCode = generateShortSyncCode(cleanEmail);
+    const userId = `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const now = Date.now();
+
+    const snapshot = initialSnapshot && typeof initialSnapshot === "object"
+      ? {
+          activeGameState: initialSnapshot.activeGameState || null,
+          saves: Array.isArray(initialSnapshot.saves) ? initialSnapshot.saves : [],
+          customStories: Array.isArray(initialSnapshot.customStories) ? initialSnapshot.customStories : [],
+          chatHistories: initialSnapshot.chatHistories || {},
+          settings: initialSnapshot.settings || {},
+          syncedAt: now,
+          stepCount: initialSnapshot.activeGameState?.stepCount || 1,
+          storyTitle: initialSnapshot.activeGameState?.story?.title || "Повесть",
+        }
+      : {
+          activeGameState: null,
+          saves: [],
+          customStories: [],
+          chatHistories: {},
+          settings: {},
+          syncedAt: now,
+          stepCount: 1,
+          storyTitle: "",
+        };
+
+    const newUser: StoryZoneUserAccount = {
+      id: userId,
+      username: cleanUsername,
+      email: cleanEmail,
+      passwordHash: hashPassword(password),
+      pinCode,
+      createdAt: now,
+      lastLoginAt: now,
+      lastSyncedAt: now,
+      devices: [
+        {
+          deviceId: deviceId || `dev_${Math.random().toString(36).substring(2, 8)}`,
+          deviceName: deviceName || "Браузер / ПК",
+          lastSeen: now,
+        },
+      ],
+      snapshot,
+    };
+
+    db.users[cleanEmail] = newUser;
+    saveUserAccountsDb(db);
+
+    // Also mirror into existing cloud_storage_db for compatibility
+    try {
+      const legacyDb = loadCloudStorageDb();
+      if (!legacyDb.accounts[cleanEmail]) {
+        legacyDb.accounts[cleanEmail] = {
+          accountKey: cleanEmail,
+          shortCode: pinCode,
+          lastSyncedAt: now,
+          stories: {},
+        };
+        saveCloudStorageDb(legacyDb);
+      }
+    } catch (e) {}
+
+    res.json({
+      success: true,
+      user: {
+        id: newUser.id,
+        username: newUser.username,
+        email: newUser.email,
+        pinCode: newUser.pinCode,
+        createdAt: newUser.createdAt,
+        lastSyncedAt: newUser.lastSyncedAt,
+        devicesCount: newUser.devices.length,
+      },
+      snapshot: newUser.snapshot,
+      message: `Учётная запись «${newUser.username}» успешно создана! Все данные и главы синхронизированы в облаке.`,
+    });
+  } catch (err: any) {
+    console.error("Account registration error:", err);
+    res.status(500).json({ error: "Ошибка при регистрации учётной записи" });
+  }
+});
+
+// 2. User Login with Cross-Device Snapshot Retrieval
+app.post("/api/account/login", async (req, res) => {
+  try {
+    const { emailOrPin, password, pinCode, deviceName, deviceId } = req.body;
+
+    if (!emailOrPin && !pinCode) {
+      return res.status(400).json({ error: "Введите email или 6-значный PIN-код синхронизации." });
+    }
+
+    const db = loadUserAccountsDb();
+    const now = Date.now();
+    let foundUser: StoryZoneUserAccount | null = null;
+
+    // Search by exact email or PIN code
+    const query = ((emailOrPin || pinCode || "") as string).trim().toLowerCase();
+    const upperPin = query.toUpperCase();
+
+    if (db.users[query]) {
+      foundUser = db.users[query];
+    } else {
+      // Find by PIN code or username
+      foundUser = Object.values(db.users).find(
+        (u) => u.pinCode.toUpperCase() === upperPin || u.username.toLowerCase() === query
+      ) || null;
+    }
+
+    if (!foundUser) {
+      return res.status(404).json({
+        error: "Аккаунт не найден. Проверьте правильность email или PIN-кода, либо зарегистрируйтесь.",
+      });
+    }
+
+    // If password provided, verify hash
+    if (password && typeof password === "string") {
+      const hashed = hashPassword(password);
+      if (foundUser.passwordHash && foundUser.passwordHash !== hashed) {
+        return res.status(401).json({ error: "Неверный пароль. Попробуйте снова или используйте PIN-код." });
+      }
+    }
+
+    // Register / update device
+    const curDeviceId = deviceId || `dev_${Math.random().toString(36).substring(2, 8)}`;
+    const curDeviceName = deviceName || "Устройство пользователя";
+    const existingDevIndex = foundUser.devices.findIndex((d) => d.deviceId === curDeviceId);
+    if (existingDevIndex >= 0) {
+      foundUser.devices[existingDevIndex].lastSeen = now;
+      foundUser.devices[existingDevIndex].deviceName = curDeviceName;
+    } else {
+      foundUser.devices.push({ deviceId: curDeviceId, deviceName: curDeviceName, lastSeen: now });
+    }
+
+    foundUser.lastLoginAt = now;
+    saveUserAccountsDb(db);
+
+    res.json({
+      success: true,
+      user: {
+        id: foundUser.id,
+        username: foundUser.username,
+        email: foundUser.email,
+        pinCode: foundUser.pinCode,
+        createdAt: foundUser.createdAt,
+        lastSyncedAt: foundUser.lastSyncedAt,
+        devicesCount: foundUser.devices.length,
+      },
+      snapshot: foundUser.snapshot,
+      message: `Добро пожаловать, ${foundUser.username}! Весь прогресс загружен из вашей учётной записи.`,
+    });
+  } catch (err: any) {
+    console.error("Account login error:", err);
+    res.status(500).json({ error: "Ошибка при входе в учётную запись" });
+  }
+});
+
+// 3. Continuous Full Progress Cloud Sync (All stories, chapters, co-author facts, saves, chat)
+app.post("/api/account/sync", async (req, res) => {
+  try {
+    const { email, pinCode, snapshot, deviceName, deviceId } = req.body;
+
+    if (!email && !pinCode) {
+      return res.status(400).json({ error: "Отсутствует идентификатор учётной записи" });
+    }
+    if (!snapshot || typeof snapshot !== "object") {
+      return res.status(400).json({ error: "Отсутствует снимок данных для синхронизации" });
+    }
+
+    const db = loadUserAccountsDb();
+    const cleanEmail = (email || "").trim().toLowerCase();
+    const cleanPin = (pinCode || "").trim().toUpperCase();
+
+    let user: StoryZoneUserAccount | null = null;
+    if (cleanEmail && db.users[cleanEmail]) {
+      user = db.users[cleanEmail];
+    } else if (cleanPin) {
+      user = Object.values(db.users).find((u) => u.pinCode.toUpperCase() === cleanPin) || null;
+    }
+
+    if (!user) {
+      return res.status(404).json({ error: "Пользователь не найден в базе облачной синхронизации" });
+    }
+
+    const now = Date.now();
+
+    // Update snapshot with latest state
+    user.snapshot = {
+      activeGameState: snapshot.activeGameState !== undefined ? snapshot.activeGameState : user.snapshot.activeGameState,
+      saves: Array.isArray(snapshot.saves) ? snapshot.saves : user.snapshot.saves,
+      customStories: Array.isArray(snapshot.customStories) ? snapshot.customStories : user.snapshot.customStories,
+      chatHistories: snapshot.chatHistories || user.snapshot.chatHistories || {},
+      settings: snapshot.settings || user.snapshot.settings || {},
+      syncedAt: now,
+      stepCount: snapshot.activeGameState?.stepCount || user.snapshot.stepCount || 1,
+      storyTitle: snapshot.activeGameState?.story?.title || user.snapshot.storyTitle || "Повесть",
+    };
+
+    user.lastSyncedAt = now;
+
+    // Track active device
+    if (deviceId || deviceName) {
+      const devId = deviceId || "web_client";
+      const devName = deviceName || "Веб-клиент";
+      const devIdx = user.devices.findIndex((d) => d.deviceId === devId);
+      if (devIdx >= 0) {
+        user.devices[devIdx].lastSeen = now;
+        user.devices[devIdx].deviceName = devName;
+      } else {
+        user.devices.push({ deviceId: devId, deviceName: devName, lastSeen: now });
+      }
+    }
+
+    saveUserAccountsDb(db);
+
+    res.json({
+      success: true,
+      lastSyncedAt: now,
+      pinCode: user.pinCode,
+      message: "Все данные, главы, ответы соавтора и истории сохранены в вашей учётной записи!",
+    });
+  } catch (err: any) {
+    console.error("Account sync error:", err);
+    res.status(500).json({ error: "Ошибка сохранения данных в учётной записи" });
+  }
+});
+
+// 4. Fetch Full Snapshot by Account Email or PIN Code
+app.get("/api/account/snapshot", async (req, res) => {
+  try {
+    const rawEmail = ((req.query.email as string) || "").trim().toLowerCase();
+    const rawPin = ((req.query.pinCode as string) || "").trim().toUpperCase();
+
+    if (!rawEmail && !rawPin) {
+      return res.status(400).json({ error: "Укажите email или PIN-код учётной записи" });
+    }
+
+    const db = loadUserAccountsDb();
+    let user: StoryZoneUserAccount | null = null;
+    if (rawEmail && db.users[rawEmail]) {
+      user = db.users[rawEmail];
+    } else if (rawPin) {
+      user = Object.values(db.users).find((u) => u.pinCode.toUpperCase() === rawPin) || null;
+    }
+
+    if (!user) {
+      return res.status(404).json({ error: "Учётная запись не найдена" });
+    }
+
+    res.json({
+      success: true,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        pinCode: user.pinCode,
+        lastSyncedAt: user.lastSyncedAt,
+        devicesCount: user.devices.length,
+      },
+      snapshot: user.snapshot,
+    });
+  } catch (err: any) {
+    console.error("Account snapshot fetch error:", err);
+    res.status(500).json({ error: "Ошибка загрузки снимка учётной записи" });
+  }
+});
+
+// 5. Account Status & Quick Health Check
+app.get("/api/account/status", async (req, res) => {
+  try {
+    const rawEmail = ((req.query.email as string) || "").trim().toLowerCase();
+    const rawPin = ((req.query.pinCode as string) || "").trim().toUpperCase();
+
+    const db = loadUserAccountsDb();
+    let user: StoryZoneUserAccount | null = null;
+    if (rawEmail && db.users[rawEmail]) {
+      user = db.users[rawEmail];
+    } else if (rawPin) {
+      user = Object.values(db.users).find((u) => u.pinCode.toUpperCase() === rawPin) || null;
+    }
+
+    if (!user) {
+      return res.json({ loggedIn: false, exists: false });
+    }
+
+    res.json({
+      loggedIn: true,
+      exists: true,
+      username: user.username,
+      email: user.email,
+      pinCode: user.pinCode,
+      lastSyncedAt: user.lastSyncedAt,
+      devicesCount: user.devices.length,
+      stepCount: user.snapshot.stepCount || 1,
+      storyTitle: user.snapshot.storyTitle || "",
+      savesCount: user.snapshot.saves?.length || 0,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Status check error" });
+  }
+});
+
+function formatAgreementsPromptBlock(coAuthorAgreements: any[]): string {
+  if (!Array.isArray(coAuthorAgreements) || coAuthorAgreements.length === 0) {
+    return "";
+  }
+  return `=== СОГЛАСОВАННЫЕ ДЕТАЛИ И ДОГОВОРЁННОСТИ С СОАВТОРОМ (AGREEMENTS LOG — НЕПРЕЛОЖНЫЙ КАНОН) ===
+Пользователь зафиксировал ключевые факты и договоренности сюжета, которые ИИ ОБЯЗАН ЗАПОМНИТЬ И СОБЛЮДАТЬ НАВСЕГДА.
+(ЕДИНСТВЕННОЕ ИСКЛЮЧЕНИЕ: если в ходе сюжета не произойдет явного сюжетного действия игрока, напрямую касающегося этого факта и меняющего его):
+${coAuthorAgreements.map((a: any, idx: number) => `• [${a.category || "правило_сюжета"}] «${a.title || `Деталь #${idx + 1}`}»: ${a.content}`).join("\n")}
+СТРОЖАЙШИЙ ЗАКОН: Категорически запрещено забывать эти факты, противоречить им или искажать их, пока игрок своим явным действием не изменит их в сюжете!\n`;
+}
+
 // 5. Next Scene Progression with Ultra Deep Memory, Focus & Style
 app.post("/api/story/act", async (req, res) => {
   try {
@@ -627,6 +1371,10 @@ app.post("/api/story/act", async (req, res) => {
       customKey,
       universeSetting,
       searchGroundingEnabled: reqSearchGrounding,
+      coAuthorAgreements,
+      authorDictateMode,
+      strictActionFidelity = true,
+      proportionalActionScaling = true,
     } = req.body;
 
     const universe = universeSetting || {};
@@ -640,6 +1388,34 @@ app.post("/api/story/act", async (req, res) => {
       : "Местные гильдии, ордены и правители";
     const canonStrictness = universe.canonStrictness || "adaptive";
     const searchGroundingEnabled = Boolean(universe.searchGroundingEnabled ?? reqSearchGrounding);
+
+    // Calculate action size and proportional chapter expansion requirements
+    const cleanAction = String(action || "").trim();
+    const actionWords = cleanAction.split(/\s+/).filter(Boolean).length;
+    const isActionDetailed = actionWords >= 22 || cleanAction.length >= 130;
+    const isActionMassive = actionWords >= 45 || cleanAction.length >= 260;
+
+    let scalingInstruction = "";
+    let targetLengthDescription = "не менее 3-5 содержательных абзацев с живыми диалогами, атмосферой и органичным развитием событий";
+
+    if (proportionalActionScaling && isActionDetailed) {
+      if (isActionMassive) {
+        scalingInstruction = `\n🔥 СОРАЗМЕРНОЕ МАСШТАБИРОВАНИЕ ГЛАВЫ (ОБЪЁМНОЕ ДЕТАЛЬНОЕ ДЕЙСТВИЕ АВТОРА — ${actionWords} СЛОВ / ${cleanAction.length} ЗНАКОВ):
+Автор ввёл масштабное, комплексное действие с несколькими этапами, репликами диалога или тактическими манёврами!
+КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО пытаться втиснуть это действие в стандартный короткий объём!
+ТРЕБОВАНИЕ: Пропорционально расширь объём главы до 6-10 БОГАТЫХ ЛИТЕРАТУРНЫХ АБЗАЦЕВ!
+Раскрой каждый пункт, каждый тактический шаг, живую реакцию спутников и окружения обстоятельно и кинематографично, давая развёрнутую романную главу!`;
+        targetLengthDescription = "Развёрнутый романный объём (6-10 глубоких, подробных литературных абзацев, пропорционально масштабу действия автора)";
+      } else {
+        scalingInstruction = `\n⚡ СОРАЗМЕРНОЕ МАСШТАБИРОВАНИЕ ГЛАВЫ (РАЗВЁРНУТОЕ ДЕЙСТВИЕ АВТОРА — ${actionWords} СЛОВ):
+Автор написал развёрнутое действие. Не пытайся сжать его в шаблонный объём: пропорционально увеличь главу до 5-8 богатых литературных абзацев, детально раскрывая каждую реплику и движение!`;
+        targetLengthDescription = "Увеличенный литературный объём (5-8 детальных абзацев, пропорционально развёрнутому действию автора)";
+      }
+    } else if (generationLength === "short") {
+      targetLengthDescription = "Динамичный текст (2-3 ёмких, хлёстких абзаца без лишней воды)";
+    } else if (generationLength === "long") {
+      targetLengthDescription = "Развёрнутый романный текст (5-8 глубоких, детальных литературных абзацев с развёрнутыми диалогами и психологией)";
+    }
 
     const styleInstructions: Record<string, string> = {
       brutal: "СТИЛЬ ПОВЕСТВОВАНИЯ: ЖЁСТКИЙ РЕАЛИЗМ / DARK FANTASY. Никаких соплей, розовых иллюзий, морализаторства и витиеватой высокопарности. Приземлённый, хлёсткий, суровый слог. Цена ошибок высока, мир опасен, действия имеют прямые физические последствия.",
@@ -688,23 +1464,23 @@ app.post("/api/story/act", async (req, res) => {
       }
     }
 
-    // Build memory context across all chapters (up to 25 chapters)
+    // Build memory context across all chapters (up to 25 chapters) with explicit chosen actions
     let memoryBlock = "";
     if (Array.isArray(memoryChapters) && memoryChapters.length > 0) {
-      memoryBlock = `ПОЛНАЯ ХРОНИКА ВСЕХ ПРЕДЫДУЩИХ ГЛАВ (СКВОЗНАЯ ПАМЯТЬ СЮЖЕТА ЗА ВСЮ ИСТОРИЮ):\n` +
+      memoryBlock = `ПОЛНАЯ ХРОНИКА ВСЕХ ПРЕДЫДУЩИХ ГЛАВ (СКВОЗНАЯ ПАМЯТЬ СЮЖЕТА И ВЫБОРОВ ЗА ВСЮ ИСТОРИЮ):\n` +
         memoryChapters
           .slice(-25)
-          .map((c: any) => `• Глава ${c.chapterNumber || ""}: «${c.title || ""}». Кратко: ${c.summary || ""}. Зафиксированные факты: ${(c.keyFacts || []).join("; ")}`)
+          .map((c: any) => `• Глава ${c.chapterNumber || ""}: «${c.title || ""}» | Решение/ход автора: «${c.chosenAction || "Начало пути"}» | Итог событий: ${c.summary || ""}. Зафиксированные факты: ${(c.keyFacts || []).join("; ")}`)
           .join("\n");
     }
 
-    // Build recent history of player steps & narrative flow
+    // Build recent history of player steps & narrative flow with richer context
     let historyBlock = "";
     if (Array.isArray(history) && history.length > 0) {
-      historyBlock = `ПОСЛЕДНИЕ ШАГИ И ВЫБОРЫ ИГРОКА (НЕПРЕРЫВНАЯ ЦЕПЬ СОБЫТИЙ):\n` +
+      historyBlock = `ПОСЛЕДНИЕ ШАГИ И ВЫБОРЫ ИГРОКА (НЕПРЕРЫВНАЯ ЦЕПЬ СОБЫТИЙ И ПРИЧИННО-СЛЕДСТВЕННАЯ СВЯЗЬ):\n` +
         history
           .slice(-8)
-          .map((h: any) => `• Шаг ${h.stepNumber}: Игрок выбрал/предпринял: «${h.action || "Действие"}». ${h.wasEdited ? "[Отредактировано автором — строгий канон]" : ""}\n  Контекст шага: ${h.sceneText ? h.sceneText.slice(0, 160).trim() + "..." : ""}`)
+          .map((h: any) => `• Шаг ${h.stepNumber}: Игрок предпринял: «${h.action || "Действие"}». ${h.wasEdited ? "[Отредактировано автором — строгий канон]" : ""}\n  Что произошло: ${h.sceneText ? h.sceneText.slice(0, 320).trim() + "..." : ""}`)
           .join("\n");
     }
 
@@ -741,6 +1517,28 @@ app.post("/api/story/act", async (req, res) => {
       (req.body.aiPromptDirective || "").trim() ||
       "Исполняй действие игрока точно и без задержек. Излагай текст в строгом соответствии с выбранным стилем повествования, без навязчивого морализаторства, нравоучений и лишней воды.";
 
+    // Context Summarization Service: compute concise narrative context before turn
+    const narrativeContextSummary = await generateNarrativeContextSummary({
+      storyTitle: storyTitle || "История",
+      genre: genre || "Фэнтези",
+      currentScene: currentScene || "",
+      characters: Array.isArray(characters) ? characters : [],
+      history: Array.isArray(history) ? history : [],
+      memoryChapters: Array.isArray(memoryChapters) ? memoryChapters : [],
+      lorebook: Array.isArray(lorebook) ? lorebook : [],
+      action: action || "Продолжение пути",
+      narrativeStyle,
+      customKey,
+    });
+
+    const enrichedSystemPrompt = `${aiSystemPrompt}
+
+=== ОПЕРАТИВНЫЙ СЦЕНАРНЫЙ КОНТЕКСТ И ПСИХОЛОГИЧЕСКИЕ ЯКОРЯ (NARRATIVE CONTEXT) ===
+${narrativeContextSummary}
+НЕПРЕЛОЖНОЕ ТРЕБОВАНИЕ: Сохраняй непрерывность психологии персонажей, их накопленный багаж отношений и причинно-следственную цепь в соответствии с этим контекстом, предотвращая амнезию и дрейф характеров (memory drift)!`;
+
+    const agreementsBlock = formatAgreementsPromptBlock(coAuthorAgreements);
+
     const prompt = `Ты — выдающийся мастер интерактивной литературы и интерактивных романов в StoryZone.
 История: "${storyTitle}" (Жанр: ${genre}).
 
@@ -753,8 +1551,13 @@ ${worldRules}
 • Режим каноничности: ${canonStrictness === "strict" ? "СТРОГИЙ КАНОН (неукоснительно следуй оригинальному лору, каноничным именам, терминологии и законам)" : canonStrictness === "alternate" ? "АЛЬТЕРНАТИВНЫЙ КАНОН / WHAT IF (опора на сеттинг с правом на смелые сюжетные развилки)" : "АДАПТИВНЫЙ КАНОН (аутентичный дух вселенной с органичным развитием истории игрока)"}.
 • Поиск актуального канона через Google Search: ${searchGroundingEnabled ? "ВКЛЮЧЕН (опирайся на точные факты, локации и реалии вселенной)" : "ВЫКЛЮЧЕН"}.
 
+${agreementsBlock}
+
 ГЛАВНОЕ ТРЕБОВАНИЕ К СЕТТИНГУ:
 Генерируй продолжение главы с максимальной аутентичностью к вселенной «${universeName}»! Используй подлинные названия, терминологию, атмосферу, типы магии/технологий, особенности снаряжения и специфику окружения, характерные именно для этого сеттинга.
+
+=== ОПЕРАТИВНЫЙ СЦЕНАРНЫЙ КОНТЕКСТ НЕПРЕРЫВНОСТИ (NARRATIVE CONTEXT) ===
+${narrativeContextSummary}
 
 === ГЛОБАЛЬНЫЙ СИСТЕМНЫЙ ПРОМПТ ИИ (НЕПРЕЛОЖНЫЕ ЗАКОНЫ ПОВЕДЕНИЯ И ЛОГИКИ) ===
 ${aiSystemPrompt}
@@ -762,26 +1565,27 @@ ${aiSystemPrompt}
 ГЛАВНАЯ ТВОРЧЕСКАЯ ИНСТРУКЦИЯ (ДИРЕКТИВА АВТОРА):
 «${userPromptDirective}»
 
-СВЕРХВАЖНОЕ ПРАВИЛО №1: ПОЛНОЕ И БЕЗОГОВОРОЧНОЕ ВОПЛОЩЕНИЕ ДЕЙСТВИЯ АВТОРА / ИГРОКА:
+${strictActionFidelity !== false ? `=== СВЕРХВАЖНОЕ ПРАВИЛО №1: 100% ТОЧНОЕ И СТРОГОЕ СОБЛЮДЕНИЕ ДЕЙСТВИЯ АВТОРА / ИГРОКА ===
 Действие читателя/автора:
 """${action}"""
 
-КАТЕГОРИЧЕСКИЙ АНТИ-КЛИШЕ И АНТИ-ШАБЛОННЫЙ ЗАПРЕТ:
-1. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО цитировать действие игрока или оборачивать его слова в кавычки в самом художественном тексте (например: «Вы выбрали...», «Вы решили предпринять: "..."», «Сделав: "..."»). Никаких кавычек вокруг текста действия и никакого сухого пересказа того, что автор только что написал!
-2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНЫ дешёвые литературные штампы и графоманские клише:
-   - ЗАПРЕЩЕНО: «тучи сгущаются», «небо затягивают тучи», «тьма накрывает», «тьма сгущается над головой»
-   - ЗАПРЕЩЕНО: «вы стремительны», «ваши движения стремительны», «стремительно метнувшись», «действуя стремительно»
-   - ЗАПРЕЩЕНО: «воздух звенит от напряжения», «холодок пробежал по спине», «в этот судьбоносный/роковой миг», «решение принято безотлагательно»
-3. ОБРАБОТКА ДЛИННОГО, МАСШТАБНОГО И ДЕТАЛЬНОГО ДЕЙСТВИЯ (ОГРОМНЫЙ РАЗМЕР ДЕЙСТВИЯ):
-   - Пользователь имеет право вводить длинные, сложные, комплексные действия любого объёма: развёрнутые диалоги, хитрые тактические планы, многоходовки, заклинания, изменения окружения, взаимодействие с несколькими персонажами сразу.
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО сжимать или игнорировать части длинного действия!
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО выдавать шаблонные отписки («События развиваются стремительно...», «Вы переходите к решительным действиям...»)!
-   - ВОПЛОЩАЙ КАЖДЫЙ ЭЛЕМЕНТ И ПУНКТ ДЕЙСТВИЯ В ОРГАНИЧНОМ ЛИТЕРАТУРНОМ ТЕКСТЕ:
-     * Если в действии есть прямая речь — собеседники слушают и отвечают именно на эти реплики с учётом их характеров и контекста;
-     * Если предложен тактический манёвр или использование предметов/магии — распиши процесс применения, физику, свет, звук и непосредственный материальный эффект;
-     * Если действие затрагивает спутников — покажи их живую реакцию (удивление, помощь, спор или восхищение планом);
-     * Развивай действие до логического сюжетного последствия, выводя героев на новую захватывающую ступень.
-4. Читатель обладает абсолютной творческой властью над историей. Никаких обесцениваний («вы попытались, но ничего не вышло»). Воплощай замысел автора органично, литературно, глубоко и с предельным уважением к его тексту!
+КАТЕГОРИЧЕСКИЕ И НЕПРЕЛОЖНЫЕ ЗАКОНЫ ВОПЛОЩЕНИЯ ДЕЙСТВИЯ:
+1. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО переворачивать действие автора с ног на голову!
+   - Запрещено делать так, чтобы вместо задуманного автором поступка произошло противоположное.
+   - Запрещено обесценивать действие автора нелепыми роялями в кустах («но вдруг из ниоткуда появился враг и прервал вас», «но нога предательски соскользнула», «но вам помешали»), если сам автор этого не написал!
+   - Если автор решил нанести удар, применить магию, сказать конкретные слова, скрыться или договориться — этот поступок СОВЕРШАЕТСЯ НА САМОМ ДЕЛЕ, с реальным физическим и сюжетным эффектом!
+2. ПОЛНОЕ И ЧЕСТНОЕ ВОПЛОЩЕНИЕ:
+   - Если в действии есть реплики персонажа автора — собеседники слышат их и отвечают именно на них.
+   - Никаких шаблонных отписок («Вы попытались, но ничего не вышло»). Автор обладает абсолютным творческим приоритетом над ходом событий!
+3. КАТЕГОРИЧЕСКИЙ АНТИ-КЛИШЕ И АНТИ-ШАБЛОННЫЙ ЗАПРЕТ:
+   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО цитировать действие игрока или оборачивать его слова в кавычки в самом художественном тексте (например: «Вы выбрали...», «Вы решили: "..."»). Никаких кавычек вокруг текста действия!
+   - ЗАПРЕЩЕНЫ штампы: «тучи сгущаются», «тьма накрывает», «вы стремительны», «воздух звенит от напряжения», «холодок пробежал по спине».
+` : `
+Действие читателя/автора:
+"""${action}"""
+Воплощай задумку автора органично в ткани сцены.
+`}
+${scalingInstruction}
 
 КРИТИЧЕСКИЕ ПРАВИЛА ЛОГИКИ И ЖИВОГО ПОВЕСТВОВАНИЯ:
 1. ПРАВИЛО ЗНАКОМСТВА И ИМЁН (ЗАПРЕТ ТЕЛЕПАТИИ И ВСЕВЕДЕНИЯ):
@@ -802,6 +1606,17 @@ ${aiSystemPrompt}
    - Никаких провалов в памяти! Персонажи помнят, кто вы такой, что вы для них сделали 5 или 10 глав назад, и ведут себя соответственно накопленному опыту.
    - История обязана развиваться ЛАКОНИЧНО, ЛОГИЧНО И ПОСЛЕДОВАТЕЛЬНО, без нелепых нестыковок и искусственных барьеров.
 
+4. РАЗМЕРЕННЫЙ ПЕЙСИНГ И ПОЛНОЦЕННОЕ ВОПЛОЩЕНИЕ ДЕЙСТВИЯ (ЗАПРЕТ СПЕШКИ И СКОМКАННОСТИ):
+   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО стремительно бежать вперёд, проглатывая действие автора в паре сухих предложений!
+   - Полноценно и чувственно раскрой непосредственный момент выполнения действия игрока: напряжение момента, осязаемые звуки, физику движений, визуальные детали, реакцию окружения и спутников.
+   - Запрещено самовольно перематывать время на часы или дни вперёд и телепортировать героев в другую локацию. Сцена развивается органично здесь и сейчас!
+   - Если в действии есть речь — дай полноценный живой диалог с характерными интонациями, паузами и подтекстом.
+
+5. НЕИЗМЕННОСТЬ ПСИХОЛОГИЧЕСКОГО СТЕРЖНЯ И РЕЧЕВОГО ПОРТРЕТА ПЕРСОНАЖЕЙ:
+   - Характер каждого спутника стабилен и глубок. Персонажи не мутируют случайно от сцены к сцене!
+   - Сохраняй уникальный голос каждого героя: привычный тембр, лексику, отношение к опасности и юмору, личные принципы и тайны.
+   - Спутники живо реагируют на решения героя, исходя из своего неизменного характера и накопленной истории отношений.
+
 УСТАНОВКИ АВТОРСКОГО СТИЛЯ И ФОРМАТА:
 ${styleInstructions[narrativeStyle || "brutal"] || styleInstructions.brutal}
 ${lengthInstruction}
@@ -818,7 +1633,7 @@ ${rhythmInstruction}
 ТРЕБОВАНИЯ К ТЕКСТУ:
 1. Живой, динамичный, захватывающий язык строго в выбранном стиле (${narrativeStyle || "динамичный"}).
 2. ЗАПРЕЩЕНЫ механические формулировки видеоигр ("вы получили 10 урона", "проверка ловкости"). Всё через живые ощущения и действия!
-3. Соблюдай заданный объём: ${generationLength === "short" ? "2-3 ёмких динамичных абзаца" : generationLength === "long" ? "5-8 подробных романных абзацев" : "не менее 3-5 богатых литературных абзацев"}. Если действие пользователя развёрнутое и детальное, раскрывай его подробно и обстоятельно, не комкая!
+3. Соблюдай заданный объём: ${targetLengthDescription}. Если действие пользователя развёрнутое и детальное, раскрывай его подробно и обстоятельно, не комкая!
 4. Варианты выбора (choices) должны быть естественными и интригующими сюжетными развилками (3 варианта).
 
 ДАННЫЕ ПЕРСОНАЖЕЙ:
@@ -843,7 +1658,7 @@ ${currentScene}
 
 Верни строго JSON:
 {
-  "sceneText": "${generationLength === "short" ? "Динамичный художественный текст продолжения сцены на русском языке (2-3 ёмких абзаца, строго без цитат действия в кавычках и без клише)" : generationLength === "long" ? "Развёрнутый богатый художественный текст продолжения сцены на русском языке (5-8 детальных литературных абзацев с диалогами, атмосферой и последствиями, без цитат действия в кавычках и без клише)" : "Полноценный богатый художественный текст продолжения сцены на русском языке (не менее 3-5 содержательных абзацев с живыми диалогами, атмосферой и органичным развитием событий, строго без цитирования действия в кавычках и без графоманских клише)"}",
+  "sceneText": "Художественный текст продолжения сцены на русском языке (${targetLengthDescription}, строго без цитат действия в кавычках, без клише и без искажения задумки автора)",
   "dialogueSpeaker": "Имя говорящего персонажа (или null)",
   "choices": [
     {
@@ -906,7 +1721,7 @@ ${currentScene}
 
     const runResult = await runGeminiWithSearchFallback(
       prompt,
-      aiSystemPrompt,
+      enrichedSystemPrompt,
       true,
       customKey,
       searchGroundingEnabled
@@ -919,6 +1734,8 @@ ${currentScene}
     if (runResult.searchQueries && runResult.searchQueries.length > 0) {
       parsed.searchQueries = runResult.searchQueries;
     }
+
+    parsed.narrativeContextSummary = narrativeContextSummary;
 
     res.json(parsed);
   } catch (error: any) {
@@ -999,9 +1816,11 @@ app.post("/api/story/edit-chapter", async (req, res) => {
       generateNextStep,
       customKey,
       aiSystemPrompt: clientSystemPrompt,
+      coAuthorAgreements,
     } = req.body;
     const ai = getGeminiClient(customKey);
     const aiSystemPrompt = (clientSystemPrompt || "").trim() || DEFAULT_AI_SYSTEM_PROMPT;
+    const agreementsBlock = formatAgreementsPromptBlock(coAuthorAgreements);
 
     const fallbackSummary =
       editedText && editedText.length > 200
@@ -1051,7 +1870,9 @@ app.post("/api/story/edit-chapter", async (req, res) => {
     }
 
     const prompt = `Ты — нарративный архитектор и стилистический аналитик StoryZone.
-Пользователь отредактировал художественный текст главы в истории "${storyTitle || "Интерактивная сага"}" (Жанр: ${genre || "Приключения"}).
+История: "${storyTitle || "Интерактивная сага"}" (Жанр: ${genre || "Приключения"}).
+
+${agreementsBlock}
 
 ИСХОДНЫЙ ТЕКСТ (до правок):
 ${originalText || "Текст отсутствовал"}
@@ -1167,8 +1988,9 @@ ${JSON.stringify(currentChoices || [])}
 // 8. Story Memory Recall (Player asks: "What happened before?", "What did we learn about X?")
 app.post("/api/story/memory-recall", async (req, res) => {
   try {
-    const { query, memoryChapters, lorebook, characters, storyTitle, customKey } = req.body;
+    const { query, memoryChapters, lorebook, characters, storyTitle, customKey, coAuthorAgreements } = req.body;
     const ai = getGeminiClient(customKey);
+    const agreementsBlock = formatAgreementsPromptBlock(coAuthorAgreements);
 
     const chaptersText = (memoryChapters || [])
       .map((c: any) => `Глава ${c.chapterNumber}: ${c.title}. ${c.summary}`)
@@ -1179,6 +2001,8 @@ app.post("/api/story/memory-recall", async (req, res) => {
 
     const prompt = `Ты — Хранитель Памяти и Хроник истории "${storyTitle}".
 Игрок задаёт вопрос о прошлых событиях или деталях мира: "${query}".
+
+${agreementsBlock}
 
 Хроника прошлых глав:
 ${chaptersText || "История только началась."}
@@ -1677,8 +2501,10 @@ app.post("/api/story/tactical-action", async (req, res) => {
       musicBpm,
       customKey,
       aiSystemPrompt: clientSystemPrompt,
+      coAuthorAgreements,
     } = req.body;
     const aiSystemPrompt = (clientSystemPrompt || "").trim() || DEFAULT_AI_SYSTEM_PROMPT;
+    const agreementsBlock = formatAgreementsPromptBlock(coAuthorAgreements);
 
     const {
       stance,
@@ -1705,6 +2531,9 @@ app.post("/api/story/tactical-action", async (req, res) => {
 
     const prompt = `Ты — Мастер Боевых Сцен и Сценарист Экшена в StoryZone.
 История: "${storyTitle || "Приключение"}" (Жанр: ${genre || "Боевое фэнтези"}).
+
+${agreementsBlock}
+
 ТЕКУЩАЯ СИТУАЦИЯ:
 ${currentScene}
 
@@ -1780,8 +2609,10 @@ app.post("/api/story/inject-divergence", async (req, res) => {
       memoryChapters,
       customKey,
       aiSystemPrompt: clientSystemPrompt,
+      coAuthorAgreements,
     } = req.body;
     const aiSystemPrompt = (clientSystemPrompt || "").trim() || DEFAULT_AI_SYSTEM_PROMPT;
+    const agreementsBlock = formatAgreementsPromptBlock(coAuthorAgreements);
 
     const {
       type,
@@ -1794,6 +2625,9 @@ app.post("/api/story/inject-divergence", async (req, res) => {
 
     const prompt = `Ты — Главный Архитектор Параллельных Времён и Твистов в StoryZone.
 История: "${storyTitle}" (Жанр: ${genre}).
+
+${agreementsBlock}
+
 ТЕКУЩАЯ СЦЕНА:
 ${currentScene}
 
@@ -1959,6 +2793,10 @@ app.post("/api/story/chat", async (req, res) => {
       customKey,
       universeSetting,
       searchGroundingEnabled: reqSearchGrounding,
+      coAuthorAgreements,
+      authorDictateMode,
+      strictActionFidelity = true,
+      proportionalActionScaling = true,
     } = req.body;
 
     const ai = getGeminiClient(customKey);
@@ -1986,16 +2824,33 @@ app.post("/api/story/chat", async (req, res) => {
       : "Инвентарь пуст";
 
     const memoryText = Array.isArray(memoryChapters) && memoryChapters.length > 0
-      ? memoryChapters.slice(-10).map((m: any) => `• Глава ${m.chapterNumber || ""}: «${m.title || ""}» — ${m.summary || ""}`).join("\n")
+      ? memoryChapters.slice(-15).map((m: any) => `• Глава ${m.chapterNumber || ""}: «${m.title || ""}» | Решение/ход автора: «${m.chosenAction || "Начало пути"}» — ${m.summary || ""}`).join("\n")
       : "Первая глава повести";
 
     const loreText = Array.isArray(lorebook) && lorebook.length > 0
-      ? lorebook.slice(-10).map((l: any) => `• [${l.category || "факт"}] ${l.title}: ${l.description}`).join("\n")
+      ? lorebook.slice(-15).map((l: any) => `• [${l.category || "факт"}] ${l.title}: ${l.description}`).join("\n")
       : "Особые тайны пока не зафиксированы";
 
+    const agreementsText = Array.isArray(coAuthorAgreements) && coAuthorAgreements.length > 0
+      ? coAuthorAgreements.map((a: any, idx: number) => `• [${a.category || "правило_сюжета"}] «${a.title || `Деталь #${idx + 1}`}»: ${a.content}`).join("\n")
+      : "Пока нет зафиксированных договоренностей";
+
     const recentChat = Array.isArray(messages)
-      ? messages.slice(-6).map((m: any) => `${m.role === "user" ? "Читатель" : "ИИ-Соавтор"}: ${m.content}`).join("\n")
+      ? messages.slice(-8).map((m: any) => `${m.role === "user" ? "Автор" : "ИИ-Соавтор"}: ${m.content}`).join("\n")
       : "";
+
+    const isDictateTrigger = Boolean(
+      authorDictateMode ||
+      (userMessage && (
+        userMessage.toLowerCase().includes("принять сюжет") ||
+        userMessage.toLowerCase().includes("принудительно") ||
+        userMessage.toLowerCase().includes("утверди сюжет") ||
+        userMessage.toLowerCase().includes("не спорь") ||
+        userMessage.toLowerCase().includes("без споров") ||
+        userMessage.toLowerCase().includes("я так решил") ||
+        userMessage.toLowerCase().includes("закрепи поворот")
+      ))
+    );
 
     const prompt = `Ты — Персональный ИИ-Соавтор, Архитектор Сюжета и Мастер Игры (Game Master) для интерактивной книги в StoryZone.
 История: "${storyTitle || "Интерактивная повесть"}" (Жанр: ${genre || "Фэнтези"}).
@@ -2012,6 +2867,10 @@ app.post("/api/story/chat", async (req, res) => {
 • Режим канона: ${canonStrictness === "strict" ? "СТРОГИЙ КАНОН ВСЕЛЕННОЙ" : canonStrictness === "alternate" ? "АЛЬТЕРНАТИВНАЯ ВСЕЛЕННАЯ" : "АДАПТИВНЫЙ КАНОН"}
 • Поиск актуального канона через Google Search: ${searchGroundingEnabled ? "ВКЛЮЧЕН (активно проверяй факты, хронологию и реалии вселенной через Google Search!)" : "ВЫКЛЮЧЕН"}
 
+=== СОГЛАСОВАННЫЕ ДЕТАЛИ И ДОГОВОРЁННОСТИ С СОАВТОРОМ (СТРОГИЙ КАНОН) ===
+${agreementsText}
+НЕПРЕЛОЖНОЕ ТРЕБОВАНИЕ: Никогда не забывай об этих согласованных деталях! Опирайся на них во всех ответах и сюжетных ходах.
+
 АКТИВНЫЙ КАНОН ТЕКУЩЕЙ СЦЕНЫ:
 ${currentScene || "Начало странствия"}
 
@@ -2021,7 +2880,7 @@ ${charactersText}
 ИНВЕНТАРЬ И ПРЕДМЕТЫ:
 ${inventoryText}
 
-ХРОНИКА ПРОШЛЫХ ГЛАВ:
+ХРОНИКА ПРОШЛЫХ ГЛАВ И РЕШЕНИЙ АВТОРА:
 ${memoryText}
 
 ИЗВЕСТНЫЙ ЛОР И ТАЙНЫ:
@@ -2033,8 +2892,32 @@ ${loreText}
 НЕДАВНИЙ ДИАЛОГ С СОАВТОРОМ:
 ${recentChat || "Диалог только начинается"}
 
-НОВЫЙ ЗАПРОС ЧИТАТЕЛЯ К ТЕБЕ (СОАВТОРУ):
+НОВЫЙ ЗАПРОС ЧИТАТЕЛЯ/АВТОРА К ТЕБЕ (СОАВТОРУ):
 "${userMessage || "Что посоветуешь предпринять дальше?"}"
+
+${isDictateTrigger ? `=== СВЕРХРЕЖИМ: БЕЗОГОВОРОЧНОЕ ПРИНЯТИЕ СЮЖЕТА (ДИКТАТ АВТОРА / ПРИНУДИТЕЛЬНОЕ СОГЛАСИЕ) ===
+• АВТОР — ГЛАВНЫЙ СЦЕНАРИСТ И ВЛАДЕЛЕЦ ИСТОРИИ.
+• КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО спорить с автором о каноне, выдвигать возражения, критиковать его замысел или читать нотации!
+• Если автор говорит что нужно сделать или задаёт сюжетный поворот:
+  1. Сразу скажи: «Принято, Автор! Твоё слово — непреложный закон сюжета. Никаких споров: закрепляем этот поворот в канон безоговорочно.»
+  2. Поддержи замысел автора с энтузиазмом и покажи, как эффектно раскрыть его в повествовании.
+  3. ОБЯЗАТЕЛЬНО сформируй "actionProposal" с type: "accept_plot":
+     {
+       "type": "accept_plot",
+       "title": "⚡ Безоговорочно утвердить сюжет в канон",
+       "description": "Принять данный сюжетный поворот автора в канон истории без споров",
+       "payload": {
+         "title": "Утверждённый поворот: ${userMessage ? userMessage.slice(0, 45).replace(/"/g, "'") : "Воля автора"}",
+         "content": "${userMessage ? userMessage.slice(0, 160).replace(/"/g, "'") : "Сюжетный поворот утверждён автором"}",
+         "category": "plot_rule",
+         "targetSceneText": null
+       }
+     }
+  4. Автор должен сразу получить в интерфейсе кнопку немедленного принятия сюжета!
+` : `=== ВАЖНО: АНАЛИЗ И СОВЕТЫ СОАВТОРА ===
+1. Будь честным профессиональным соавтором. Если автор спрашивает твоё объективное мнение — аргументируй с опорой на лор.
+2. Но если автор прямо просит утвердить сюжет («принять сюжет», «утверди», «без споров») — никогда не спорь, уважай волю создателя и возвращай actionProposal "accept_plot"!
+`}
 
 === КРИТИЧЕСКИ ВАЖНО: ЗАПРОСЫ ПО ПЕРСОНАЖАМ, ЛОРУ И МИРОУСТРОЙСТВУ ВСЕЛЕННОЙ ===
 Если читатель спрашивает про персонажей вселенной, каноничных героев, лор, сюжет оригинала, историю или мироустройство «${universeName}»:
@@ -2044,6 +2927,29 @@ ${recentChat || "Диалог только начинается"}
 4. Раскрой реальный лор: историю мира, законы магии или технологий, действующие фракции и философские дилеммы сеттинга.
 5. Предложи читателю возможность встретить или ввести любого из этих каноничных героев в историю (через actionProposal add_character или execute_action).
 
+=== КАТЕГОРИИ СЦЕНАРНЫХ ФОРМАТОВ, МУЛЬТИМЕДИА И ССЫЛОК НА ПЕРВОИСТОЧНИКИ ===
+1. ТЕКСТОВЫЕ СЦЕНАРИИ ЛЮБОГО ВИДА, РАЗМЕРА И ФОРМАТА:
+   По запросу автора ты умеешь преобразовывать, расписывать и иллюстрировать сцены в любом формате:
+   • Киносценарий (Голливудский / Режиссерский): SLUGLINE (ИНТ./НАТ. - ДЕНЬ/НОЧЬ), действие, ремарки и реплики с подтекстом;
+   • Театральная пьеса: ремарки, паузы [Пауза в три секунды], полифония, психологические паузы;
+   • Ранобэ / Light Novel: внутренний голос, японские восклицания, акценты на ракурсах и взглядах;
+   • RPG-квест (Witcher 3 / BG3): ветвящееся древо диалогов с репликами [Сила], [Убеждение], [Хитрость] и скрытыми последствиями;
+   • Боевая хореография: пошаговый расчет инерции, дистанции клинков, тактических ошибок и финтов;
+   • Сенсорная виньетка: осязаемая атмосфера через 5 чувств (звуки, запахи сырости/железа, свет, тактильность).
+
+2. ССЫЛКИ ДЛЯ ИЗУЧЕНИЯ В КОНКРЕТНЫХ ИСТОЧНИКАХ:
+   Если автор обсуждает канон, лор или исторический факт, обязательно приводи точные прямые Markdown-ссылки на авторитетные источники:
+   • Фандом-энциклопедии (Fandom / Wikia);
+   • TV Tropes (литературные тропы и приемы);
+   • Википедия и исторические архивы;
+   • Сценарные базы и сценарии первоисточников.
+   Форматируй как удобные кликабельные ссылки: [Название источника: Тема](https://...).
+
+3. МУЛЬТИМЕДИА ОБРАБОТКА (ФОТО, ВИДЕО, АУДИО РЕФЕРЕНСЫ):
+   • Визуальные / Фото-референсы: предлагай точные визуальные детали (оттенки ткани, гравировка рукояти, тип доспеха, освещение), чтобы обогатить сцену;
+   • Кино-раскадровка и видео-референсы: подсказывай операторские ракурсы (крупный план глаз, голландский угол тревоги, панорама битвы);
+   • Аудио-саундскейп: расписывай звуковую партитуру сцены (шелест дождя по черепице, скрип половиц, затихающий гул колокола).
+
 ТВОИ ВОЗМОЖНОСТИ И ОБЯЗАННОСТИ:
 1. Отвечай живым, увлекательным, остроумным и профессиональным языком писателя, знатока вселенной «${universeName}» и режиссера в формате Markdown.
 2. Ты можешь делать ВСЁ:
@@ -2051,7 +2957,7 @@ ${recentChat || "Диалог только начинается"}
    - Раскрывать психологию персонажей, объяснять их реакцию и советовать, как улучшить отношения.
    - Предлагать неожиданные сюжетные твисты, параллельные развилки или тайны.
    - Помогать перенастроить книгу прямо на ходу: стиль повествования, длину глав, жанр, параметры вселенной, директиву ИИ.
-   - Предлагать готовые сцены или ходы для немедленного воплощения.
+   - Предлагать готовые сценарии любого формата (киносценарий, пьеса, диалоговое древо, боевая хореография) для немедленного воплощения.
 
 3. СТРУКТУРИРОВАННЫЙ ACTION PROPOSAL:
    Если запрос предполагает изменение параметров повести, добавление персонажа, обновление сеттинга или немедленный ход, обязательно прикрепи "actionProposal":
@@ -2117,6 +3023,480 @@ ${recentChat || "Диалог только начинается"}
     console.error("Story chat error:", error);
     const { userMessage, currentScene, characters, genre, narrativeStyle, generationLength, universeSetting, searchGroundingEnabled } = req.body;
     res.json(generateProceduralChatFallback(userMessage, currentScene, characters, genre, narrativeStyle, generationLength, universeSetting, searchGroundingEnabled));
+  }
+});
+
+// ==============================================================================
+// 15.6. SCENARIO LAB & MULTIMEDIA CO-AUTHOR WORKSPACE ENDPOINTS
+// ==============================================================================
+
+// Helper: Curate real external study links for deep lore and scriptwriting craft
+function getStudyLinksForContext(universeName: string, genre: string, format: string) {
+  const links: any[] = [];
+  const u = (universeName || "").toLowerCase();
+
+  // 1. Scriptwriting & scenario format resources
+  if (format === "screenplay") {
+    links.push({
+      title: "Scriptnotes & Hollywood Screenplay Format",
+      url: "https://johnaugust.com/scriptnotes",
+      category: "screenplay",
+      description: "Профессиональный стандарт голливудской сценарной записи (sluglines, ремарки, диалоги).",
+    });
+    links.push({
+      title: "Script Slug: База реальных киносценариев",
+      url: "https://www.scriptslug.com",
+      category: "screenplay",
+      description: "Оригинальные сценарии мировых шедевров кино для изучения структуры.",
+    });
+  } else if (format === "branching") {
+    links.push({
+      title: "Choice of Games & Интерактивная драматургия",
+      url: "https://www.choiceofgames.com",
+      category: "trope",
+      description: "Теория интерактивных развилок, дизайн ветвления выборов и цены ошибок.",
+    });
+    links.push({
+      title: "TV Tropes: Choose Your Own Adventure",
+      url: "https://tvtropes.org/pmwiki/pmwiki.php/Main/ChooseYourOwnAdventure",
+      category: "trope",
+      description: "Анализ классических приёмов и ловушек интерактивного ветвления сюжета.",
+    });
+  } else if (format === "beatsheet") {
+    links.push({
+      title: "Save the Cat! Beat Sheet Calculator",
+      url: "https://savethecat.com",
+      category: "screenplay",
+      description: "Золотой стандарт Блейка Снайдера: 15 ритмических битов истории от катализатора до развязки.",
+    });
+  } else if (format === "drama") {
+    links.push({
+      title: "Theatrical Dramatic Beats & Subtext Guide",
+      url: "https://en.wikipedia.org/wiki/Dramatic_structure",
+      category: "screenplay",
+      description: "Теория драматического подтекста, сценических пауз и реплик.",
+    });
+  }
+
+  // 2. Universe specific encyclopedias
+  if (u.includes("ведьмак") || u.includes("witcher")) {
+    links.push({
+      title: "Witcher Wiki (Каноничная база Сапковского и игр)",
+      url: "https://witcher.fandom.com/ru/wiki/",
+      category: "fandom",
+      description: "Подробный лор Континента, бестиарий, хронология войн и канон магии.",
+    });
+  } else if (u.includes("поттер") || u.includes("potter") || u.includes("хогвартс")) {
+    links.push({
+      title: "Harry Potter Fandom Wiki & Wizarding World",
+      url: "https://harrypotter.fandom.com/ru/wiki/",
+      category: "fandom",
+      description: "Точные заклинания, канон факультетов, артефакты и законы магического мира.",
+    });
+  } else if (u.includes("звёздные войны") || u.includes("star wars")) {
+    links.push({
+      title: "Wookieepedia (Энциклопедия Star Wars)",
+      url: "https://starwars.fandom.com/wiki/",
+      category: "fandom",
+      description: "Абсолютный архив Star Wars: Сила, планеты, корабли, световые мечи и таймлайны.",
+    });
+  } else if (u.includes("вархаммер") || u.includes("warhammer") || u.includes("40k")) {
+    links.push({
+      title: "Lexicanum: Warhammer 40k Encyclopedia",
+      url: "https://wh40k.lexicanum.com/wiki/",
+      category: "fandom",
+      description: "Фундаментальный архив Империума, Хаоса, Астартес и космологии 40-го тысячелетия.",
+    });
+  } else if (u.includes("киберпанк") || u.includes("cyberpunk")) {
+    links.push({
+      title: "Cyberpunk Wiki & World of Night City",
+      url: "https://cyberpunk.fandom.com/wiki/",
+      category: "fandom",
+      description: "Лор Майка Пондсмита, импланты, мегакорпорации и нетраннинг.",
+    });
+  } else {
+    links.push({
+      title: `Fandom Encyclopedia: ${universeName || genre}`,
+      url: `https://www.google.com/search?q=${encodeURIComponent((universeName || genre) + " wiki fandom canon lore")}`,
+      category: "fandom",
+      description: `Глубокий поиск каноничных источников и фандом-вики по вселенной «${universeName || genre}».`,
+    });
+  }
+
+  // 3. Narrative craft & writing theory
+  links.push({
+    title: "TV Tropes: Мастерская литературных тропов",
+    url: "https://tvtropes.org",
+    category: "trope",
+    description: "Колоссальная библиотека сюжетных архетипов, штампов и способов их оригинального слома.",
+  });
+  links.push({
+    title: "World History Encyclopedia (Исторический контекст)",
+    url: "https://www.worldhistory.org",
+    category: "worldbuilding",
+    description: "Достоверные исторические реалии, оружие, быт и культура для реалистичного сеттинга.",
+  });
+  links.push({
+    title: "YouTube Video: Кинематографический анализ сцен",
+    url: "https://www.youtube.com/results?search_query=" + encodeURIComponent(`cinematography directing scene analysis ${genre}`),
+    category: "video",
+    description: "Видеоразборы режиссуры, постановки света и кадрирования для визуального вдохновения.",
+  });
+
+  return links;
+}
+
+// Endpoint: Generate Multi-Format Scenario Example with Links & Directing notes
+app.post("/api/story/scenario-lab", async (req, res) => {
+  try {
+    const {
+      scenarioFormat,
+      scenarioSize,
+      storyTitle,
+      genre,
+      currentScene,
+      characters,
+      universeSetting,
+      focusGoal,
+      customKey,
+    } = req.body;
+
+    const format = scenarioFormat || "screenplay";
+    const size = scenarioSize || "medium";
+    const universe = universeSetting || { universeName: genre || "Фэнтези" };
+    const safeCharacters = Array.isArray(characters) ? characters : [];
+    const charNames = safeCharacters.map((c: any) => c.name).join(", ") || "Главный герой";
+
+    const ai = getGeminiClient(customKey);
+    const studyLinks = getStudyLinksForContext(universe.universeName, genre, format);
+
+    if (!ai) {
+      // High-quality procedural scenario template
+      const fallbackTitles: Record<string, string> = {
+        screenplay: `Киносценарий: Поворотный момент в «${storyTitle || "Повести"}»`,
+        branching: `Интерактивная развилка с тремя исходами`,
+        novel: `Художественный романный фрагмент с сенсорными деталями`,
+        drama: `Театральная сцена: Напряжённый спор соратников`,
+        beatsheet: `Сценарный бит-шит (Save the Cat) для текущей арки`,
+        tactical: `Тактический разбор схватки и применения навыков`,
+      };
+
+      const fallbackContent: Record<string, string> = {
+        screenplay: `ИНТ. УБЕЖИЩЕ - СУМЕРКИ\n\nТусклый свет факелов отбрасывает дрожащие тени на гранитные своды. На полу — развёрнутая карта с обугленными краями.\n\n${charNames.toUpperCase()}\n(вполголоса, глядя на проход)\nМы не можем ждать рассвета. Если патруль перекроет мост, пути назад не будет.\n\nШорох осыпающихся камней за спиной. Воздух наполняется тяжёлым запахом озона.\n\nГЕРОЙ\n(не оборачиваясь)\nТогда мы идём первыми. Приготовь оружие.`,
+        branching: `ВЕТКА А [Скрытный обход через нижние ярусы]:\n• Проверка: Ловкость и внимание.\n• Награда: Сохранение эффекта неожиданности, обнаружение тайника.\n• Риск: Узкое пространство, сложно отступать при обнаружении.\n\nВЕТКА Б [Прямой тактический прорыв с боем]:\n• Проверка: Сила и боевая слаженность.\n• Награда: Деморализация противника, контроль ключевой высоты.\n• Риск: Трата энергии и боеприпасов, привлечение подкреплений.\n\nВЕТКА В [Дипломатический блеф или отвлекающий манёвр]:\n• Проверка: Харизма и знание местных законов/фракций.\n• Награда: Бескровное решение, шанс завербовать союзника.\n• Риск: Высокая цена ошибки при раскрытии обмана.`,
+        novel: `Капли влаги мерно срывались с каменного карниза, разбиваясь о базальтовые плиты с глухим, отчётливым звоном. В воздухе стоял стойкий запах мокрого железа и холодного пепла. Каждый вдох отзывался в груди лёгким покалыванием — верный признак того, что барьер вокруг цитадели истончается.\n\n${safeCharacters[0]?.name || "Спутник"} шагнул ближе, едва слышно скрипнув кожаной перевязью. Во взгляде читалась не паника, а холодная, расчётливая настороженность хищника, зажатого в угол. Никто из них не произнёс ни слова: слишком многое было сказано за прошедшие мили пути, и сейчас каждое движение имело абсолютный вес.`,
+        drama: `ДЕЙСТВУЮЩИЕ ЛИЦА: Герой, ${charNames}.\nДЕКОРАЦИИ: Освещённый багровым огнём зал. Стол, заваленный древними свитками.\n\n${charNames.toUpperCase()}: (резко ударяет ладонью по столу) Ты требуешь невозможного! Мы отдадим им печать — и что останется нам? Прах?\n\nГЕРОЙ: (длинная пауза; говорит тихо, но твёрдо) Нам останется время. А время сейчас дороже всех печатей королевства.\n\n[${charNames.toUpperCase()} замирает. Взгляд мечется от двери к символам на свитке. В воздухе повисает тяжёлое молчание.]`,
+        beatsheet: `1. УСТАНОВКА (Setup): Текущее положение отряда, остаток ресурсов и главная цель.\n2. КАТАЛИЗАТОР (Catalyst): Внезапное изменение обстановки (сигнал тревоги / появление вестника).\n3. ДИЛЕММА (Debate): Споры о цене действия и расхождение интересов спутников.\n4. ПЕРЕХОД ВО ВТОРОЙ АКТ: Точка невозврата — герой делает решительный шаг.\n5. ТОЧКА КРИЗИСА (Midpoint): Ставки удваиваются, раскрывается скрытый мотив врага.\n6. КУЛЬМИНАЦИЯ (Climax): Момент наивысшего напряжения и личной жертвы.\n7. РАЗВЯЗКА (Resolution): Новый статус-кво и последствия выбора.`,
+        tactical: `ТАКТИЧЕСКАЯ ДИСПОЗИЦИЯ:\n• Дистанция: 15 шагов до укрытия противника.\n• Рельеф: Загромождённый каменными обломками коридор, скользкие плиты.\n• Преимущество: Верхний ярус даёт +20% к точности дальнего боя.\n• Действие соратника (${safeCharacters[0]?.name || "Спутник"}): Удержание левого фланга, подавление лучников.\n• Уязвимость врага: Медлительность в тяжёлой броне при фланговой атаке.`,
+      };
+
+      return res.json({
+        title: fallbackTitles[format] || "Сценарный пример",
+        format,
+        size,
+        content: fallbackContent[format] || fallbackContent.screenplay,
+        formattingNotes: `Формат «${format}». Полная совместимость со стилем вселенной «${universe.universeName}».`,
+        visualCues: [
+          "Контрастное боковое освещение (кинематографичный chiaroscuro)",
+          "Цветовая температура: холодный сине-стальной с тёплыми акцентами огня",
+          "Фокус на взглядах персонажей и микромимике",
+        ],
+        audioCues: {
+          suggestedBpm: format === "tactical" ? 130 : 80,
+          soundscapeTrack: format === "tactical" ? "battle" : "dark",
+          sfxMarkers: ["Глухой стук капель", "Скрип натянутой тетивы", "Далёкий раскат грома"],
+        },
+        directingNotes: "Камера на уровне глаз персонажей. Плавный наезд (Dolly In) в момент кульминационной реплики.",
+        studyLinks,
+      });
+    }
+
+    const formatInstructions: Record<string, string> = {
+      screenplay: "Классический голливудский киносценарий (Sluglines: ИНТ./НАТ., блок описания действия с глаголами в настоящем времени, имя персонажа по центру заглавными, родительские ремарки в скобках, живой диалог).",
+      branching: "Интерактивная развилка с 3 ветками выборов: для каждой укажи условие/проверку, награду, риск, скрытый сюжетный твист и эмоциональную цену.",
+      novel: "Литературная проза высшей пробы: глубокий психологизм, осязаемые сенсорные якоря (тактильность, свет, запах, звук), живой темпоритм и выразительный слог.",
+      drama: "Театральная драматургия: сценические ремарки, конфликт подтекста, смена эмоциональных доминант, драматические паузы и выразительные жесты.",
+      beatsheet: "Сценарный бит-шит (Save the Cat / Syd Field): структурируй сцену по 7 ключевым битам драматургии.",
+      tactical: "Тактический RPG-энкаунтер: инициатива, дистанции, свойства местности, синергия навыков героя и спутников, физика повреждений и окружения.",
+    };
+
+    const sizeInstructions: Record<string, string> = {
+      short: "Краткий ёмкий этюд (1-2 фокусные сцены без лишней воды).",
+      medium: "Полноценная развёрнутая драматическая сцена (3-5 богатых блоков).",
+      epic: "Монументальный масштабный фрагмент с глубокой проработкой всех деталей, диалогов и окружения.",
+    };
+
+    const prompt = `Ты — ведущий голливудский сценарист, мастер интерактивной литературы и консультант по мироустройству.
+Создай эталонный наглядный текстовый сценарий / практический пример для автора повести «${storyTitle || "История"}».
+
+СЕТТИНГ И ВСЕЛЕННАЯ:
+• Вселенная: «${universe.universeName}»
+• Жанр: ${genre || "Фэнтези"}
+• Персонажи сцены: ${charNames}
+• Текущая ситуация в книге:
+"""${(currentScene || "").slice(0, 900)}"""
+
+ТРЕБУЕМЫЙ ФОРМАТ И РАЗМЕР:
+• Формат: ${format} — ${formatInstructions[format] || formatInstructions.screenplay}
+• Объём: ${size} — ${sizeInstructions[size] || sizeInstructions.medium}
+• Фокус/задача: ${focusGoal || "Яркое, глубокое раскрытие конфликта текущей сцены"}
+
+ТРЕБОВАНИЯ К КАЧЕСТВУ:
+1. Текст должен быть безупречно оформлен в стандартах выбранного формата.
+2. Никаких клише и штампов! Живой, острый язык, точные психологические реакции спутников.
+3. Добавь визуальные маркеры (освещение, композиция, ракурс камеры), звуковые маркеры (BPM, саундскейп, звуковые эффекты) и режиссёрские советы.
+
+Верни строго JSON объект следующей структуры:
+{
+  "title": "Ёмкое художественное название сценария/примера",
+  "content": "Текст сценария с полным сохранением форматирования (переносы строк, капслок для имён и локаций)",
+  "formattingNotes": "Краткое пояснение, как устроена эта сценарная форма и почему она работает",
+  "visualCues": ["Визуальный маркер 1 (свет/ракурс)", "Визуальный маркер 2", "Визуальный маркер 3"],
+  "audioCues": {
+    "suggestedBpm": 90,
+    "soundscapeTrack": "battle|mystic|cyber|campfire|romance|dark|calm",
+    "sfxMarkers": ["Звуковой эффект 1", "Звуковой эффект 2", "Звуковой эффект 3"]
+  },
+  "directingNotes": "Режиссёрский совет по постановке и темпоритму этой сцены"
+}`;
+
+    const raw = await runGeminiWithFallback(prompt, undefined, true, customKey);
+    const parsed = JSON.parse(raw);
+
+    res.json({
+      title: parsed.title || `Сценарий: ${format}`,
+      format,
+      size,
+      content: parsed.content || "",
+      formattingNotes: parsed.formattingNotes || `Формат ${format} для вселенной ${universe.universeName}`,
+      visualCues: Array.isArray(parsed.visualCues) ? parsed.visualCues : ["Кинематографичное освещение", "Глубина кадра"],
+      audioCues: parsed.audioCues || { suggestedBpm: 90, soundscapeTrack: "mystic", sfxMarkers: ["Звук шагов", "Шёпот ветра"] },
+      directingNotes: parsed.directingNotes || "Фокусируйся на живом ритме и психологической достоверности.",
+      studyLinks,
+    });
+  } catch (err: any) {
+    console.error("Scenario lab error:", err);
+    res.status(500).json({ error: "Не удалось сгенерировать сценарий" });
+  }
+});
+
+// Endpoint: Extract Sensory Details from Media (Images, Photos, Audio/Video cues)
+app.post("/api/story/extract-media-details", async (req, res) => {
+  try {
+    const { imageBase64, mediaNotes, sceneContext, universeName, customKey } = req.body;
+    const ai = getGeminiClient(customKey);
+
+    if (!ai) {
+      return res.json({
+        sensoryDetails: [
+          "Контрастная игра света и тени, подчёркивающая текстуру камня и металла",
+          "Холодная цветовая палитра с вкраплениями тёплых отблесков",
+          "Осязаемая шероховатость материалов и натяжение тканей",
+        ],
+        audioDescriptors: [
+          "Приглушённое эхо шагов в замкнутом пространстве",
+          "Низкий фоновый гул ветра в щелях кладки",
+        ],
+        narrativeInjection:
+          "Свет падал под острым углом, выхватывая из полумрака шероховатую поверхность камня и матовый блеск воронёной стали. В воздухе зависла тонкая пыльная взвесь, пахнущая сухой землёй и давней тревогой.",
+        suggestedAction: "Внимательно изучить открывшиеся детали и сделать осторожный шаг вперёд.",
+      });
+    }
+
+    const cleanBase64 = (imageBase64 || "").replace(/^data:image\/\w+;base64,/, "");
+
+    const promptText = `Ты — мастер художественной детализации и соавтор литературных произведений.
+Изучи предоставленные медиа-данные / визуальный референс / заметки для вселенной «${universeName || "Фэнтези"}».
+Контекст сцены: "${(sceneContext || "").slice(0, 500)}".
+Заметки автора: "${mediaNotes || "Проанализируй детали для обогащения текста"}".
+
+Извлеки максимум живых, осязаемых сенсорных деталей, которые автор может немедленно внедрить в текст повести:
+1. Сенсорные детали (освещение, фактура поверхностей, запахи, температура, ткани, оружие).
+2. Звуковые детали (акустика, тембр голосов, фоновый шум).
+3. Готовый художественный абзац литературного текста (narrativeInjection), написанный отточенным стилем, готовый для вставки в главу.
+4. Конкретное следующее действие для автора (suggestedAction).
+
+Верни строго JSON:
+{
+  "sensoryDetails": ["Деталь 1", "Деталь 2", "Деталь 3"],
+  "audioDescriptors": ["Звук 1", "Звук 2"],
+  "narrativeInjection": "Художественный абзац текста на русском языке (3-4 выразительных предложения)",
+  "suggestedAction": "Конкретное действие для продолжения"
+}`;
+
+    let resultText = "";
+    if (cleanBase64) {
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: {
+          parts: [
+            { text: promptText },
+            {
+              inlineData: {
+                data: cleanBase64,
+                mimeType: "image/jpeg",
+              },
+            },
+          ],
+        },
+      });
+      resultText = response.text || "{}";
+    } else {
+      resultText = await runGeminiWithFallback(promptText, undefined, true, customKey);
+    }
+
+    const parsed = JSON.parse(resultText);
+    res.json({
+      sensoryDetails: Array.isArray(parsed.sensoryDetails) ? parsed.sensoryDetails : [],
+      audioDescriptors: Array.isArray(parsed.audioDescriptors) ? parsed.audioDescriptors : [],
+      narrativeInjection: parsed.narrativeInjection || "",
+      suggestedAction: parsed.suggestedAction || "Продолжить исследование окружения.",
+    });
+  } catch (err: any) {
+    console.error("Extract media details error:", err);
+    res.status(500).json({ error: "Не удалось извлечь детали медиа" });
+  }
+});
+
+// Endpoint: Unified Multi-Format Media & Attachment Processor (+ File Uploads)
+app.post("/api/media/process-files", async (req, res) => {
+  try {
+    const {
+      fileName,
+      fileType,
+      category, // "photo" | "audio" | "video" | "text_doc"
+      fileBase64,
+      textContent,
+      sceneContext,
+      universeName,
+      characterName,
+      usageTarget, // "scene_detail" | "character_voice" | "character_appearance" | "character_pose" | "story_script" | "lorebook" | "background_ost"
+      customKey,
+    } = req.body;
+
+    const ai = getGeminiClient(customKey);
+    const cleanBase64 = (fileBase64 || "").replace(/^data:[\w/+-]+;base64,/, "");
+
+    if (!ai) {
+      // High-quality procedural fallback based on category
+      const fallbacks: Record<string, any> = {
+        photo: {
+          analysisSummary: `Анализ изображения «${fileName || "фото"}»: визуальный референс внешности, позы и освещения.`,
+          poseDescription: "Уверенная собранная стойка, готовность к мгновенному действию или защите.",
+          appearanceDetails: "Выразительный взгляд, проработанные детали экипировки и одежды, динамичный силуэт.",
+          narrativeParagraph:
+            "Контрастный свет очертил строгие контуры силуэта, подчеркнув текстуру экипировки и холодный отблеск металла. В каждом движении читалась отточенная годами уверенность.",
+          suggestedAction: "Сделать шаг вперед, удерживая инициативу и оценивая обстановку.",
+          voiceDescriptors: { timbre: "Уверенный ровный голос", pitch: 1.0, rate: 1.0 },
+        },
+        audio: {
+          analysisSummary: `Анализ аудио «${fileName || "запись"}»: звуковой референс тембра и акустической среды.`,
+          voiceDescriptors: {
+            timbre: "Глубокий бархатный тембр с лёгкой хрипотцой и чёткой дикцией",
+            pitch: 0.9,
+            rate: 1.0,
+            recommendedTone: "Спокойный, веский, не терпящий возражений",
+          },
+          audioMood: "Напряжённый кинематографичный саундтрек с нарастающим ритмом",
+          narrativeParagraph:
+            "Голос прозвучал низко и веско, отразившись от стен коротким плотным эхом. В этой интонации не было сомнений — лишь спокойная сила того, кто знает исход наперёд.",
+          suggestedAction: "Ответить прямо, не отводя взгляда.",
+        },
+        video: {
+          analysisSummary: `Анализ видео «${fileName || "видео"}»: кинематографическая хореография и динамика сцены.`,
+          poseDescription: "Быстрый переход из статического положения в стремительный выпад.",
+          directingNotes: "Панорамирование ручной камерой на уровне пояса с акцентом на скорость реакции.",
+          narrativeParagraph:
+            "Движение произошло стремительно и без замаха: сокращение дистанции, смещение корпуса и точный выверенный жест, оставивший противника на шаг позади.",
+          suggestedAction: "Закрепить тактическое преимущество перехватом инициативы.",
+        },
+        text_doc: {
+          analysisSummary: `Анализ документа «${fileName || "файл"}»: извлечены ключевые сценарные факты и досье.`,
+          lorebookCandidate: {
+            title: `Материалы из «${fileName || "документа"}»`,
+            description: (textContent || "").slice(0, 300) || "Сюжетные заметки и каноничные факты.",
+          },
+          narrativeParagraph:
+            "Записи подтверждали давние подозрения: за чередой разрозненных событий проглядывал единый, тщательно выверенный замысел.",
+          suggestedAction: "Использовать полученные сведения при разговоре со спутниками.",
+        },
+      };
+
+      const fallbackData = fallbacks[category] || fallbacks.photo;
+      return res.json(fallbackData);
+    }
+
+    const promptText = `Ты — ведущий мультимодальный аналитик интерактивной литературы и соавтор повести.
+Изучи прикрепленный файл: «${fileName}» (Тип: ${fileType}, Категория: ${category}).
+Контекст вселенной: «${universeName || "Свободный сеттинг"}».
+Персонаж (если указан): ${characterName || "Главный герой / Спутник"}.
+Цель использования: ${usageTarget || "обогащение сцены и персонажа"}.
+Текстовое содержание (если есть):
+"""${(textContent || "").slice(0, 1500)}"""
+Контекст текущей главы:
+"""${(sceneContext || "").slice(0, 600)}"""
+
+Сделай глубокий сценарный разбор для автора повести:
+1. Краткая ёмкая выжимка (analysisSummary);
+2. Если фото/видео — поза, мимика, внешность, ракурс, одежда (poseDescription, appearanceDetails);
+3. Если аудио/голос — тембр, высота (pitch 0.5-1.5), темп (rate 0.8-1.3), акустика (voiceDescriptors: { timbre, pitch, rate, recommendedTone });
+4. Готовый литературный абзац для вставки в главу книги (narrativeParagraph) — 3-4 богатых предложения высшей литературной пробы;
+5. Рекомендуемое следующее действие автора (suggestedAction);
+6. Кандидат для добавления в Лорбук (lorebookCandidate: { title, description }).
+
+Верни строго JSON:
+{
+  "analysisSummary": "Краткое резюме анализа",
+  "poseDescription": "Описание позы или кинематографии",
+  "appearanceDetails": "Детали внешности, экипировки, взгляда",
+  "voiceDescriptors": {
+    "timbre": "Описание тембра голоса",
+    "pitch": 0.95,
+    "rate": 1.0,
+    "recommendedTone": "Интонация"
+  },
+  "narrativeParagraph": "Литературный абзац на русском языке",
+  "suggestedAction": "Конкретный ход автора",
+  "lorebookCandidate": {
+    "title": "Название факта",
+    "description": "Описание факта для лорбука"
+  }
+}`;
+
+    let resultText = "";
+    if (cleanBase64 && (fileType?.startsWith("image/") || category === "photo")) {
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: {
+          parts: [
+            { text: promptText },
+            {
+              inlineData: {
+                data: cleanBase64,
+                mimeType: fileType || "image/jpeg",
+              },
+            },
+          ],
+        },
+      });
+      resultText = response.text || "{}";
+    } else {
+      resultText = await runGeminiWithFallback(promptText, undefined, true, customKey);
+    }
+
+    const parsed = JSON.parse(resultText);
+    res.json({
+      analysisSummary: parsed.analysisSummary || `Файл «${fileName}» успешно проанализирован`,
+      poseDescription: parsed.poseDescription || "Собранная внимательная поза",
+      appearanceDetails: parsed.appearanceDetails || "",
+      voiceDescriptors: parsed.voiceDescriptors || { timbre: "Выразительный голос", pitch: 1.0, rate: 1.0 },
+      narrativeParagraph: parsed.narrativeParagraph || "",
+      suggestedAction: parsed.suggestedAction || "Продолжить развитие сцены с учетом новых деталей.",
+      lorebookCandidate: parsed.lorebookCandidate || null,
+    });
+  } catch (err: any) {
+    console.error("Process files error:", err);
+    res.status(500).json({ error: "Ошибка обработки файлов" });
   }
 });
 
@@ -2559,6 +3939,40 @@ function generateProceduralChatFallback(
   const uName = universeSetting?.universeName || genre;
 
   const matchedCanon = matchCanonicalUniverse(uName) || matchCanonicalUniverse(userMsg);
+
+  // 0. Forced Plot Acceptance / Author Dictate Mode in procedural fallback
+  const isDictate =
+    msgLower.includes("принять сюжет") ||
+    msgLower.includes("принудительн") ||
+    msgLower.includes("утверди сюжет") ||
+    msgLower.includes("не спорь") ||
+    msgLower.includes("без споров") ||
+    msgLower.includes("я так решил") ||
+    msgLower.includes("закрепи поворот") ||
+    msgLower.includes("утверди поворот");
+
+  if (isDictate) {
+    const plotContent = userMsg.length > 5 ? userMsg : "Утверждённый автором сюжетный поворот";
+    return {
+      reply: `### ⚡ Принято безоговорочно, Автор!\n\nТвоё слово — непреложный закон сюжета. Никаких споров о канонах или ограничениях: твоя творческая воля имеет абсолютный приоритет!\n\n**Зафиксировано:** «${plotContent}».\n\nНажми кнопку ниже, чтобы закрепить этот поворот в канон и в согласованные детали повести, и ИИ будет неукоснительно соблюдать его в каждой последующей главе!`,
+      actionProposal: {
+        type: "accept_plot",
+        title: "⚡ Безоговорочно утвердить сюжет в канон",
+        description: "Утвердить данный поворот в канон повести без споров",
+        payload: {
+          title: `Утверждённый сюжет: ${plotContent.slice(0, 45)}`,
+          content: plotContent,
+          category: "plot_rule",
+          injectScene: false,
+        },
+      },
+      suggestedPrompts: [
+        "Как это решение повлияет на отношения спутников?",
+        "Напиши продолжение сцены с учётом этого поворота",
+        "Какие последствия вызовет этот шаг в мире повести?",
+      ],
+    };
+  }
 
   // 1. Inquiries about CANONICAL CHARACTERS ("какие там персонажи", "кто в этом мире", "герои вселенной")
   const isCharacterInquiry =

@@ -13,10 +13,29 @@ export interface SafeFetchResult<T> {
 export async function safeFetchJson<T>(
   url: string,
   options?: RequestInit,
-  fallbackData?: T
+  fallbackData?: T,
+  timeoutMs: number = 32000
 ): Promise<SafeFetchResult<T>> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort(new Error(`Timeout after ${timeoutMs}ms`));
+  }, timeoutMs);
+
+  // If caller already provided a signal, link it
+  if (options?.signal) {
+    options.signal.addEventListener("abort", () => {
+      controller.abort(options.signal?.reason);
+    });
+  }
+
+  const fetchOptions: RequestInit = {
+    ...options,
+    signal: controller.signal,
+  };
+
   try {
-    const res = await fetch(url, options);
+    const res = await fetch(url, fetchOptions);
+    clearTimeout(timeoutId);
     const contentType = res.headers.get("content-type") || "";
     const text = await res.text();
 
@@ -54,11 +73,13 @@ export async function safeFetchJson<T>(
       };
     }
   } catch (netErr: any) {
-    console.warn(`[SafeFetch] Network or fetch error for ${url}:`, netErr?.message);
+    clearTimeout(timeoutId);
+    const isAbort = netErr?.name === "AbortError" || netErr?.message?.includes("Timeout");
+    console.warn(`[SafeFetch] Network or timeout error for ${url}:`, isAbort ? "Request timed out" : netErr?.message);
     return {
       ok: false,
       data: fallbackData as T,
-      error: netErr?.message,
+      error: isAbort ? "Превышено время ожидания ответа ИИ" : (netErr?.message || "Ошибка сети"),
     };
   }
 }

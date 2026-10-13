@@ -113,6 +113,9 @@ interface SettingsModalProps {
   setAiSystemPrompt: (prompt: string) => void;
   gameState?: ActiveGameState | null;
   onImportGameState?: (newState: ActiveGameState) => void;
+  onToggleCoAuthorMode?: (val: boolean) => void;
+  onToggleStrictActionFidelity?: (val: boolean) => void;
+  onToggleProportionalActionScaling?: (val: boolean) => void;
 }
 
 const THEMES: { id: ReaderTheme; name: string; previewColor: string }[] = [
@@ -145,6 +148,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   setAiSystemPrompt,
   gameState,
   onImportGameState,
+  onToggleCoAuthorMode,
+  onToggleStrictActionFidelity,
+  onToggleProportionalActionScaling,
 }) => {
   const [activeTab, setActiveTab] = useState<"ai" | "appearance" | "backup">("ai");
   const [testingKey, setTestingKey] = useState(false);
@@ -587,6 +593,111 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   />
                 </button>
               </div>
+
+              {/* Co-Author Mode (Режим соавтора) Setting */}
+              {gameState && (
+                <div className="p-3.5 rounded-xl bg-purple-950/40 border border-purple-600/70 flex items-center justify-between">
+                  <div className="space-y-0.5 pr-2">
+                    <div className="text-xs font-semibold text-purple-200 flex items-center gap-1.5">
+                      <Bot className="w-3.5 h-3.5 text-purple-400" />
+                      Режим соавтора (Co-Author Mode: подтверждение каждого ответа)
+                    </div>
+                    <p className="text-[11px] text-neutral-300">
+                      При включении режима ИИ требует подтверждения от пользователя после каждого сгенерированного ответа через кнопку <strong>«Принять сюжет»</strong>, прежде чем ответ официально добавится в историю.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const next = !Boolean(gameState.coAuthorMode);
+                      if (onToggleCoAuthorMode) {
+                        onToggleCoAuthorMode(next);
+                      } else {
+                        gameState.coAuthorMode = next;
+                      }
+                      sound.playClick();
+                    }}
+                    className={`w-11 h-6 rounded-full transition-colors relative shrink-0 ${
+                      Boolean(gameState.coAuthorMode) ? "bg-purple-600" : "bg-neutral-800"
+                    }`}
+                  >
+                    <div
+                      className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${
+                        Boolean(gameState.coAuthorMode) ? "left-6" : "left-1"
+                      }`}
+                    />
+                  </button>
+                </div>
+              )}
+
+              {/* Strict Action Fidelity Setting */}
+              {gameState && (
+                <div className="p-3.5 rounded-xl bg-neutral-950/80 border border-neutral-800 flex items-center justify-between">
+                  <div className="space-y-0.5 pr-2">
+                    <div className="text-xs font-semibold text-neutral-200 flex items-center gap-1.5">
+                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                      Строгое воплощение действий автора (Защита от искажения замысла)
+                    </div>
+                    <p className="text-[11px] text-neutral-400">
+                      ИИ обязан в точности исполнять свободные действия автора в первом предложении без подмены, отмены или переворота замысла с ног на голову.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const next = !(gameState.strictActionFidelity ?? true);
+                      if (onToggleStrictActionFidelity) {
+                        onToggleStrictActionFidelity(next);
+                      } else {
+                        gameState.strictActionFidelity = next;
+                      }
+                      sound.playClick();
+                    }}
+                    className={`w-11 h-6 rounded-full transition-colors relative shrink-0 ${
+                      (gameState.strictActionFidelity ?? true) ? "bg-emerald-600" : "bg-neutral-800"
+                    }`}
+                  >
+                    <div
+                      className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${
+                        (gameState.strictActionFidelity ?? true) ? "left-6" : "left-1"
+                      }`}
+                    />
+                  </button>
+                </div>
+              )}
+
+              {/* Proportional Action Scaling Setting */}
+              {gameState && (
+                <div className="p-3.5 rounded-xl bg-neutral-950/80 border border-neutral-800 flex items-center justify-between">
+                  <div className="space-y-0.5 pr-2">
+                    <div className="text-xs font-semibold text-neutral-200 flex items-center gap-1.5">
+                      <Sliders className="w-3.5 h-3.5 text-amber-400" />
+                      Пропорциональное масштабирование объёма глав
+                    </div>
+                    <p className="text-[11px] text-neutral-400">
+                      При вводе развёрнутого, детального действия глава автоматически увеличивается (до 4-8 абзацев романового формата), не пытаясь сжать замысел в стандартный объём.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const next = !(gameState.proportionalActionScaling ?? true);
+                      if (onToggleProportionalActionScaling) {
+                        onToggleProportionalActionScaling(next);
+                      } else {
+                        gameState.proportionalActionScaling = next;
+                      }
+                      sound.playClick();
+                    }}
+                    className={`w-11 h-6 rounded-full transition-colors relative shrink-0 ${
+                      (gameState.proportionalActionScaling ?? true) ? "bg-amber-600" : "bg-neutral-800"
+                    }`}
+                  >
+                    <div
+                      className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${
+                        (gameState.proportionalActionScaling ?? true) ? "left-6" : "left-1"
+                      }`}
+                    />
+                  </button>
+                </div>
+              )}
 
               {/* Custom API Key Configuration */}
               <div className="p-3.5 rounded-xl bg-neutral-950/80 border border-neutral-800 space-y-2.5">

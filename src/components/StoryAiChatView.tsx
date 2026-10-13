@@ -9,6 +9,7 @@ import {
   Character,
   UniverseSetting,
   LorebookEntry,
+  CoAuthorAgreement,
 } from "../types";
 import {
   Bot,
@@ -36,9 +37,18 @@ import {
   ExternalLink,
   Globe,
   Search,
+  Cloud,
+  Film,
+  Paperclip,
+  Bookmark,
+  Gavel,
+  Crown,
+  Plus,
 } from "lucide-react";
 import { sound } from "../utils/audio";
 import { safeFetchJson } from "../utils/safeApi";
+import { CoAuthorMultimediaStudio } from "./CoAuthorMultimediaStudio";
+import { AgreementsLogModal } from "./AgreementsLogModal";
 
 interface StoryAiChatViewProps {
   gameState: ActiveGameState;
@@ -59,7 +69,104 @@ interface StoryAiChatViewProps {
   onUpdateUniverseSetting?: (newSetting: UniverseSetting) => void;
   onAddLorebookEntry?: (entry: LorebookEntry) => void;
   onOpenUniverseModal?: () => void;
+  onUpdateChatHistory?: (messages: StoryChatMessage[]) => void;
+  onOpenCloudSync?: () => void;
+  onOpenMediaAttachment?: () => void;
+  onToggleAuthorDictateMode?: (enabled: boolean) => void;
+  onToggleStrictActionFidelity?: (enabled: boolean) => void;
+  onToggleProportionalActionScaling?: (enabled: boolean) => void;
+  onAddCoAuthorAgreement?: (agreement: CoAuthorAgreement) => void;
+  onRemoveCoAuthorAgreement?: (id: string) => void;
+  onUpdateCoAuthorAgreement?: (agreement: CoAuthorAgreement) => void;
 }
+
+// Isolated ChatInputBar component: handles fast typing with 0 re-renders of the full chat list
+interface ChatInputBarProps {
+  isLoading: boolean;
+  onSend: (text: string) => void;
+  onOpenMediaAttachment?: () => void;
+  isDictateMode?: boolean;
+}
+
+const ChatInputBar: React.FC<ChatInputBarProps> = React.memo(({ isLoading, onSend, onOpenMediaAttachment, isDictateMode }) => {
+  const [prompt, setPrompt] = useState("");
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!prompt.trim() || isLoading) return;
+    onSend(prompt.trim());
+    setPrompt("");
+  };
+
+  return (
+    <div className="pt-1.5">
+      <form
+        onSubmit={handleSubmit}
+        className="relative flex items-center gap-2 rounded-2xl bg-neutral-900 border border-neutral-800 focus-within:border-purple-600 focus-within:ring-1 focus-within:ring-purple-600 p-2 shadow-xl transition-all"
+      >
+        {onOpenMediaAttachment && (
+          <button
+            type="button"
+            onClick={() => {
+              sound.playClick();
+              onOpenMediaAttachment();
+            }}
+            className="p-1.5 rounded-xl text-neutral-400 hover:text-purple-300 hover:bg-neutral-800 transition-colors shrink-0"
+            title="Прикрепить файл к беседе с Соавтором (+)"
+          >
+            <Paperclip className="w-4 h-4" />
+          </button>
+        )}
+
+        <input
+          type="text"
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="Спроси о сюжете, деталях или прикажи утвердить поворот..."
+          disabled={isLoading}
+          className="flex-1 bg-transparent px-3 py-1.5 text-xs sm:text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none disabled:opacity-50"
+        />
+
+        <button
+          type="button"
+          onClick={() => {
+            sound.playAction("magic");
+            const cmd = prompt.trim()
+              ? `Принудительно утверди поворот сюжета без споров о канонах: ${prompt.trim()}`
+              : "Принудительно утверди этот сюжетный поворот без споров о канонах и выдай кнопку принятия сюжета!";
+            onSend(cmd);
+            setPrompt("");
+          }}
+          disabled={isLoading}
+          className={`p-1.5 sm:px-2.5 sm:py-1.5 rounded-xl border text-xs font-bold flex items-center gap-1 transition-all shadow-sm shrink-0 ${
+            isDictateMode
+              ? "bg-amber-900/80 hover:bg-amber-800 border-amber-500 text-amber-100 shadow-amber-950/40"
+              : "bg-neutral-950/80 hover:bg-amber-950/60 border-neutral-750 hover:border-amber-600/70 text-amber-300"
+          }`}
+          title="Принудительно потребовать от соавтора принять сюжет без споров о канонах"
+        >
+          <Gavel className="w-3.5 h-3.5 text-amber-400" />
+          <span className="hidden md:inline">⚡ Принять сюжет</span>
+        </button>
+
+        <button
+          type="submit"
+          disabled={!prompt.trim() || isLoading}
+          className="p-2 sm:px-4 sm:py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold disabled:opacity-40 disabled:hover:bg-purple-600 flex items-center gap-1.5 transition-all shadow-md shadow-purple-900/30 shrink-0"
+        >
+          {isLoading ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <>
+              <Send className="w-4 h-4" />
+              <span className="hidden sm:inline">Отправить</span>
+            </>
+          )}
+        </button>
+      </form>
+    </div>
+  );
+});
 
 export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
   gameState,
@@ -80,9 +187,41 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
   onUpdateUniverseSetting,
   onAddLorebookEntry,
   onOpenUniverseModal,
+  onUpdateChatHistory,
+  onOpenCloudSync,
+  onOpenMediaAttachment,
+  onToggleAuthorDictateMode,
+  onToggleStrictActionFidelity,
+  onToggleProportionalActionScaling,
+  onAddCoAuthorAgreement,
+  onRemoveCoAuthorAgreement,
+  onUpdateCoAuthorAgreement,
 }) => {
   const storyId = gameState.story.id;
   const storageKey = `storyzone_chat_${storyId}`;
+
+  const [activeStudioView, setActiveStudioView] = useState<"chat" | "studio">("chat");
+  const [isDictateMode, setIsDictateMode] = useState<boolean>(() => Boolean(gameState.authorDictateMode));
+  const [showAgreementsModal, setShowAgreementsModal] = useState<boolean>(false);
+  const [newAgreementTitle, setNewAgreementTitle] = useState("");
+  const [newAgreementContent, setNewAgreementContent] = useState("");
+  const [newAgreementCategory, setNewAgreementCategory] = useState<"plot_rule" | "character_trait" | "world_fact" | "style_note">("plot_rule");
+
+  // Keep isDictateMode in sync with gameState
+  useEffect(() => {
+    if (gameState.authorDictateMode !== undefined) {
+      setIsDictateMode(Boolean(gameState.authorDictateMode));
+    }
+  }, [gameState.authorDictateMode]);
+
+  const handleToggleDictateMode = () => {
+    sound.playClick();
+    const next = !isDictateMode;
+    setIsDictateMode(next);
+    if (onToggleAuthorDictateMode) {
+      onToggleAuthorDictateMode(next);
+    }
+  };
 
   const currentUniverse =
     universeSetting ||
@@ -122,7 +261,6 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
     return defaultMessages;
   });
 
-  const [inputPrompt, setInputPrompt] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [showContextDetails, setShowContextDetails] = useState(false);
   const [suggestedPrompts, setSuggestedPrompts] = useState<string[]>([
@@ -140,15 +278,18 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
 
-  // Sync chat history to localStorage
+  // Sync chat history to localStorage and parent gameState
   useEffect(() => {
     try {
       localStorage.setItem(storageKey, JSON.stringify(messages));
     } catch (e) {}
+    if (onUpdateChatHistory) {
+      onUpdateChatHistory(messages);
+    }
   }, [messages, storageKey]);
 
-  const handleSendMessage = async (textToSend?: string) => {
-    const text = (textToSend || inputPrompt).trim();
+  const handleSendMessage = async (textToSend: string) => {
+    const text = textToSend.trim();
     if (!text || isLoading) return;
 
     sound.playClick();
@@ -160,7 +301,6 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
     };
 
     setMessages((prev) => [...prev, userMsg]);
-    setInputPrompt("");
     setIsLoading(true);
 
     try {
@@ -189,6 +329,10 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
             searchGroundingEnabled,
           },
           searchGroundingEnabled,
+          coAuthorAgreements: gameState.coAuthorAgreements || [],
+          authorDictateMode: isDictateMode,
+          strictActionFidelity: gameState.strictActionFidelity ?? true,
+          proportionalActionScaling: gameState.proportionalActionScaling ?? true,
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           userMessage: text,
           customKey: customApiKey,
@@ -336,6 +480,24 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
           });
         }
         break;
+
+      case "accept_plot":
+        if (proposal.payload) {
+          const newAgree: CoAuthorAgreement = {
+            id: `agree_${Date.now()}`,
+            title: proposal.payload.title || proposal.title || "Утверждённый сюжетный поворот",
+            content: proposal.payload.content || proposal.description || "Сюжетный поворот безоговорочно утверждён автором в канон.",
+            category: proposal.payload.category || "plot_rule",
+            timestamp: Date.now(),
+          };
+          if (onAddCoAuthorAgreement) {
+            onAddCoAuthorAgreement(newAgree);
+          }
+          if (proposal.payload.injectScene && proposal.payload.targetSceneText) {
+            onInjectSceneText(proposal.payload.targetSceneText);
+          }
+        }
+        break;
     }
 
     // Mark proposal as applied in chat history
@@ -367,6 +529,8 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
 
   const getActionIcon = (type: string) => {
     switch (type) {
+      case "accept_plot":
+        return <Gavel className="w-4 h-4 text-amber-400" />;
       case "change_style":
         return <Palette className="w-4 h-4 text-purple-400" />;
       case "change_length":
@@ -469,6 +633,99 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
             )}
           </button>
 
+          {/* Mode Switcher: Chat vs Scenario & Media Studio */}
+          <div className="flex items-center gap-1 p-1 bg-neutral-950/80 rounded-xl border border-neutral-800">
+            <button
+              onClick={() => {
+                sound.playClick();
+                setActiveStudioView("chat");
+              }}
+              className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1 transition-all ${
+                activeStudioView === "chat"
+                  ? "bg-purple-600 text-white shadow-md shadow-purple-900/40"
+                  : "text-neutral-400 hover:text-neutral-200"
+              }`}
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              <span>Чат</span>
+            </button>
+
+            <button
+              onClick={() => {
+                sound.playClick();
+                setActiveStudioView("studio");
+              }}
+              className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1 transition-all ${
+                activeStudioView === "studio"
+                  ? "bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-md shadow-purple-900/40"
+                  : "text-neutral-400 hover:text-purple-300"
+              }`}
+            >
+              <Film className="w-3.5 h-3.5 text-purple-400" />
+              <span>Мастерская</span>
+            </button>
+          </div>
+
+          {onOpenCloudSync && (
+            <button
+              onClick={() => {
+                sound.playClick();
+                onOpenCloudSync();
+              }}
+              className="px-2.5 py-1.5 rounded-xl bg-purple-950/80 hover:bg-purple-900 border border-purple-700/80 text-purple-200 text-xs font-semibold flex items-center gap-1.5 transition-all shadow-sm"
+              title="Перенос истории и обсуждений на телефон или в облако"
+            >
+              <Cloud className="w-3.5 h-3.5 text-purple-400" />
+              <span className="hidden sm:inline">Телефон</span>
+            </button>
+          )}
+
+          {onOpenMediaAttachment && (
+            <button
+              onClick={() => {
+                sound.playClick();
+                onOpenMediaAttachment();
+              }}
+              className="px-2.5 py-1.5 rounded-xl bg-purple-950/80 hover:bg-purple-900 border border-purple-700/80 text-purple-200 text-xs font-semibold flex items-center gap-1.5 transition-all shadow-sm"
+              title="Медиатека & Прикрепление файлов любых форматов (+)"
+            >
+              <Paperclip className="w-3.5 h-3.5 text-purple-400" />
+              <span className="hidden sm:inline">+ Файлы</span>
+            </button>
+          )}
+
+          <button
+            onClick={handleToggleDictateMode}
+            className={`px-2.5 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-all shadow-sm ${
+              isDictateMode
+                ? "bg-amber-950/90 border-amber-500 text-amber-200 ring-1 ring-amber-500/50"
+                : "bg-neutral-950/60 border-neutral-800 text-neutral-400 hover:text-amber-300"
+            }`}
+            title={
+              isDictateMode
+                ? "Режим диктата активен: Соавтор не спорит о канонах и сразу предлагает утвердить сюжет"
+                : "Включить принудительное принятие сюжета: Соавтор не будет спорить о канонах"
+            }
+          >
+            <Gavel className={`w-3.5 h-3.5 ${isDictateMode ? "text-amber-400 animate-pulse" : "text-neutral-400"}`} />
+            <span className="hidden sm:inline">{isDictateMode ? "⚡ Диктат: ВКЛ" : "Диктат"}</span>
+          </button>
+
+          <button
+            onClick={() => {
+              sound.playClick();
+              setShowAgreementsModal(true);
+            }}
+            className="px-2.5 py-1.5 rounded-xl bg-purple-950/80 hover:bg-purple-900 border border-purple-700/80 text-purple-200 text-xs font-semibold flex items-center gap-1.5 transition-all shadow-sm"
+            title="Просмотреть и настроить согласованные детали сюжета с соавтором"
+          >
+            <Bookmark className="w-3.5 h-3.5 text-amber-400" />
+            <span className="hidden sm:inline">Согласовано</span>
+            <span className="px-1.5 py-0.2 bg-purple-900 text-[10px] rounded-full text-purple-200 font-mono">
+              {(gameState.coAuthorAgreements || []).length}
+            </span>
+          </button>
+
           <button
             onClick={() => {
               sound.playClick();
@@ -544,8 +801,43 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
         </div>
       )}
 
-      {/* Message Stream */}
-      <div className="flex-1 overflow-y-auto space-y-3.5 p-3 rounded-2xl bg-neutral-950/60 border border-neutral-800/80 shadow-inner">
+      {/* Studio View or Chat View */}
+      {activeStudioView === "studio" ? (
+        <div className="flex-1 overflow-hidden">
+          <CoAuthorMultimediaStudio
+            gameState={gameState}
+            customApiKey={customApiKey}
+            universeSetting={currentUniverse}
+            onInjectSceneText={onInjectSceneText}
+            onExecuteAction={onExecuteAction}
+            onAddLorebookEntry={onAddLorebookEntry}
+            onOpenCloudSync={onOpenCloudSync}
+            onClose={() => setActiveStudioView("chat")}
+          />
+        </div>
+      ) : (
+        <>
+          {/* Author Dictate Mode Ambient Banner */}
+          {isDictateMode && (
+            <div className="mb-2 p-2.5 rounded-xl bg-gradient-to-r from-amber-950/90 to-purple-950/90 border border-amber-600/70 text-amber-200 text-xs flex items-center justify-between gap-2 shadow-lg animate-fade-in">
+              <div className="flex items-center gap-2">
+                <Gavel className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>
+                  <strong>Режим принудительного принятия сюжета активен:</strong> Соавтор не спорит о канонах, безоговорочно принимает твои идеи и выдаёт кнопку утверждения в сюжет.
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={handleToggleDictateMode}
+                className="text-[10px] text-amber-300 hover:text-white underline shrink-0 px-1.5 py-0.5"
+              >
+                Отключить
+              </button>
+            </div>
+          )}
+
+          {/* Message Stream */}
+          <div className="flex-1 overflow-y-auto space-y-3.5 p-3 rounded-2xl bg-neutral-950/60 border border-neutral-800/80 shadow-inner">
         {messages.map((msg) => (
           <div
             key={msg.id}
@@ -574,7 +866,11 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
               {/* Action Proposal Card if attached */}
               {msg.actionProposal && (
                 <div className="mt-3 pt-3 border-t border-neutral-800/90 space-y-2">
-                  <div className="p-3 rounded-xl bg-neutral-950/90 border border-purple-800/50 space-y-2 shadow-sm">
+                  <div className={`p-3 rounded-xl border space-y-2 shadow-sm ${
+                    msg.actionProposal.type === "accept_plot"
+                      ? "bg-amber-950/80 border-amber-500/70 shadow-amber-950/30"
+                      : "bg-neutral-950/90 border-purple-800/50"
+                  }`}>
                     <div className="flex items-center gap-2">
                       <div className="p-1.5 rounded-lg bg-neutral-900 border border-neutral-700">
                         {getActionIcon(msg.actionProposal.type)}
@@ -599,10 +895,22 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
                         <button
                           type="button"
                           onClick={() => handleApplyActionProposal(msg.id, msg.actionProposal!)}
-                          className="px-3.5 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold shadow-md shadow-purple-900/40 flex items-center gap-1.5 transition-all hover:scale-105 active:scale-95"
+                          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold shadow-md flex items-center gap-1.5 transition-all hover:scale-105 active:scale-95 ${
+                            msg.actionProposal.type === "accept_plot"
+                              ? "bg-gradient-to-r from-amber-600 to-purple-600 hover:from-amber-500 hover:to-purple-500 text-white shadow-amber-950/40"
+                              : "bg-purple-600 hover:bg-purple-500 text-white shadow-purple-900/40"
+                          }`}
                         >
-                          <Zap className="w-3.5 h-3.5" />
-                          <span>Применить в игре</span>
+                          {msg.actionProposal.type === "accept_plot" ? (
+                            <Gavel className="w-3.5 h-3.5 text-amber-300" />
+                          ) : (
+                            <Zap className="w-3.5 h-3.5" />
+                          )}
+                          <span>
+                            {msg.actionProposal.type === "accept_plot"
+                              ? "⚡ Безоговорочно утвердить сюжет"
+                              : "Применить в игре"}
+                          </span>
                         </button>
                       )}
                     </div>
@@ -634,15 +942,43 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
                 </div>
               )}
 
-              <div
-                className={`text-[9px] mt-1.5 text-right font-mono ${
-                  msg.role === "user" ? "text-purple-200" : "text-neutral-500"
-                }`}
-              >
-                {new Date(msg.timestamp).toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
+              {/* Pin to Agreements Button & Timestamp */}
+              <div className="flex items-center justify-between pt-1 border-t border-neutral-800/40 mt-2 text-[10px]">
+                {msg.role === "assistant" ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playChoice();
+                      const snippet = msg.content.slice(0, 160).replace(/[#*`]/g, "").trim();
+                      const newAgree: CoAuthorAgreement = {
+                        id: `agree_${Date.now()}`,
+                        title: `Согласованная мысль #${(gameState.coAuthorAgreements || []).length + 1}`,
+                        content: snippet,
+                        category: "plot_rule",
+                        timestamp: Date.now(),
+                      };
+                      if (onAddCoAuthorAgreement) {
+                        onAddCoAuthorAgreement(newAgree);
+                      }
+                    }}
+                    className="text-amber-400 hover:text-amber-200 bg-amber-950/40 hover:bg-amber-900/60 border border-amber-800/50 px-2 py-0.5 rounded-md flex items-center gap-1 transition-colors"
+                    title="Зафиксировать эту мысль соавтора в согласованные детали (ИИ никогда не забудет её)"
+                  >
+                    <Bookmark className="w-2.5 h-2.5 text-amber-400" />
+                    <span>📌 В канон повести</span>
+                  </button>
+                ) : <span />}
+
+                <span
+                  className={`font-mono ${
+                    msg.role === "user" ? "text-purple-200" : "text-neutral-500"
+                  }`}
+                >
+                  {new Date(msg.timestamp).toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </span>
               </div>
             </div>
           </div>
@@ -683,6 +1019,18 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
 
         {/* Quick Command Pills */}
         <div className="overflow-x-auto no-scrollbar flex items-center gap-1.5 pb-1">
+          {/* Open Scenario & Media Studio Button */}
+          <button
+            onClick={() => {
+              sound.playClick();
+              setActiveStudioView("studio");
+            }}
+            className="whitespace-nowrap px-2.5 py-1 rounded-xl bg-gradient-to-r from-purple-900 to-indigo-900 hover:from-purple-800 hover:to-indigo-800 border border-purple-600/70 text-[11px] font-semibold text-purple-200 transition-all flex items-center gap-1 shrink-0 shadow-sm"
+          >
+            <Film className="w-3 h-3 text-purple-300" />
+            <span>Мастерская сценариев & медиа</span>
+          </button>
+
           {/* Universe Characters Command */}
           <button
             onClick={() =>
@@ -812,40 +1160,32 @@ export const StoryAiChatView: React.FC<StoryAiChatViewProps> = ({
         ))}
       </div>
 
-      {/* Input Bar */}
-      <div className="pt-1.5">
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            handleSendMessage();
-          }}
-          className="relative flex items-center gap-2 rounded-2xl bg-neutral-900 border border-neutral-800 focus-within:border-purple-600 focus-within:ring-1 focus-within:ring-purple-600 p-2 shadow-xl transition-all"
-        >
-          <input
-            type="text"
-            value={inputPrompt}
-            onChange={(e) => setInputPrompt(e.target.value)}
-            placeholder="Спроси о сюжете, персонажах или скомандуй изменить стиль/длину глав..."
-            disabled={isLoading}
-            className="flex-1 bg-transparent px-3 py-1.5 text-xs sm:text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none disabled:opacity-50"
-          />
+      {/* Isolated Fast ChatInputBar (zero re-render lag) */}
+      <ChatInputBar
+        isLoading={isLoading}
+        onSend={(text) => handleSendMessage(text)}
+        onOpenMediaAttachment={onOpenMediaAttachment}
+        isDictateMode={isDictateMode}
+      />
+        </>
+      )}
 
-          <button
-            type="submit"
-            disabled={!inputPrompt.trim() || isLoading}
-            className="p-2 sm:px-4 sm:py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold disabled:opacity-40 disabled:hover:bg-purple-600 flex items-center gap-1.5 transition-all shadow-md shadow-purple-900/30 shrink-0"
-          >
-            {isLoading ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <>
-                <Send className="w-4 h-4" />
-                <span className="hidden sm:inline">Отправить</span>
-              </>
-            )}
-          </button>
-        </form>
-      </div>
+      {/* Co-Author Agreed Details Modal (Согласованные детали повести) */}
+      <AgreementsLogModal
+        isOpen={showAgreementsModal}
+        onClose={() => setShowAgreementsModal(false)}
+        agreements={gameState.coAuthorAgreements || []}
+        onAddAgreement={(agreement) => {
+          if (onAddCoAuthorAgreement) {
+            onAddCoAuthorAgreement(agreement);
+          }
+        }}
+        onRemoveAgreement={(id) => {
+          if (onRemoveCoAuthorAgreement) {
+            onRemoveCoAuthorAgreement(id);
+          }
+        }}
+      />
     </div>
   );
 };

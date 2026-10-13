@@ -18,6 +18,7 @@ class SoundEngine {
   private musicGain: GainNode | null = null;
   private musicInterval: any = null;
   private internetAudio: HTMLAudioElement | null = null;
+  private customAudio: HTMLAudioElement | null = null;
   private rhythmPulseInterval: any = null;
 
   public sfxEnabled: boolean = true;
@@ -443,22 +444,62 @@ class SoundEngine {
     this.isRhythmPulseActive = false;
   }
 
-  // TTS Speech
-  speakScene(text: string, onEnd?: () => void) {
+  // Play custom uploaded audio file (voice sample, soundtrack, etc.)
+  playAudioUrl(url: string, onEnd?: () => void) {
+    this.stopAudioUrl();
+    try {
+      const audio = new Audio(url);
+      audio.volume = Math.max(0, Math.min(1, this.volume));
+      audio.onended = () => {
+        this.customAudio = null;
+        if (onEnd) onEnd();
+      };
+      audio.onerror = () => {
+        this.customAudio = null;
+        if (onEnd) onEnd();
+      };
+      audio.play().catch(() => {
+        if (onEnd) onEnd();
+      });
+      this.customAudio = audio;
+    } catch (e) {
+      if (onEnd) onEnd();
+    }
+  }
+
+  stopAudioUrl() {
+    if (this.customAudio) {
+      try {
+        this.customAudio.pause();
+        this.customAudio.src = "";
+      } catch (e) {}
+      this.customAudio = null;
+    }
+  }
+
+  // TTS Speech with pitch, rate, and voice profile options
+  speakScene(
+    text: string,
+    optionsOrOnEnd?: { pitch?: number; rate?: number; onEnd?: () => void } | (() => void)
+  ) {
     if (!("speechSynthesis" in window)) return;
     try {
       window.speechSynthesis.cancel();
+      this.stopAudioUrl();
       if (!text) return;
+
+      const opts = typeof optionsOrOnEnd === "object" ? optionsOrOnEnd : {};
+      const onEndCallback = typeof optionsOrOnEnd === "function" ? optionsOrOnEnd : opts.onEnd;
 
       const cleaned = text
         .replace(/[*_#`[\]()]/g, "")
         .replace(/\n+/g, ". ")
-        .slice(0, 600);
+        .slice(0, 700);
 
       const utterance = new SpeechSynthesisUtterance(cleaned);
       utterance.lang = "ru-RU";
-      utterance.rate = 1.0;
-      utterance.pitch = 0.95;
+      utterance.rate = opts.rate ?? 1.0;
+      utterance.pitch = opts.pitch ?? 0.95;
 
       const voices = window.speechSynthesis.getVoices();
       const ruVoice = voices.find((v) => v.lang.includes("ru"));
@@ -466,16 +507,34 @@ class SoundEngine {
         utterance.voice = ruVoice;
       }
 
-      if (onEnd) {
-        utterance.onend = onEnd;
-        utterance.onerror = onEnd;
+      if (onEndCallback) {
+        utterance.onend = onEndCallback;
+        utterance.onerror = onEndCallback;
       }
 
       window.speechSynthesis.speak(utterance);
     } catch (e) {}
   }
 
+  // Speak using a character's custom voice sample or synthesized voice profile
+  speakCharacter(
+    text: string,
+    char?: { voicePitch?: number; voiceRate?: number; voiceSampleUrl?: string; name?: string },
+    onEnd?: () => void
+  ) {
+    if (char?.voiceSampleUrl) {
+      this.playAudioUrl(char.voiceSampleUrl, onEnd);
+      return;
+    }
+    this.speakScene(text, {
+      pitch: char?.voicePitch ?? 1.0,
+      rate: char?.voiceRate ?? 1.0,
+      onEnd,
+    });
+  }
+
   stopSpeaking() {
+    this.stopAudioUrl();
     if ("speechSynthesis" in window) {
       window.speechSynthesis.cancel();
     }

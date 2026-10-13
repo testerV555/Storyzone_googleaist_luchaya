@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { StoryMemoryChapter, LorebookEntry, Character } from "../types";
+import { StoryMemoryChapter, LorebookEntry, Character, SceneHistoryItem } from "../types";
 import {
   BookMarked,
   X,
@@ -22,6 +22,7 @@ interface StoryMemoryDrawerProps {
   memoryChapters: StoryMemoryChapter[];
   lorebook: LorebookEntry[];
   characters: Character[];
+  history?: SceneHistoryItem[];
   storyTitle: string;
   customApiKey?: string;
 }
@@ -32,6 +33,7 @@ export const StoryMemoryDrawer: React.FC<StoryMemoryDrawerProps> = ({
   memoryChapters,
   lorebook,
   characters,
+  history,
   storyTitle,
   customApiKey,
 }) => {
@@ -191,6 +193,31 @@ export const StoryMemoryDrawer: React.FC<StoryMemoryDrawerProps> = ({
                     <p className="text-xs text-neutral-300 leading-relaxed">
                       {chap.summary}
                     </p>
+
+                    {/* Action chosen or written by player */}
+                    {(() => {
+                      const matchingHistory = history?.find(
+                        (h) => h.stepNumber === (chap.chapterNumber || idx + 1)
+                      );
+                      const actionText =
+                        chap.chosenAction ||
+                        matchingHistory?.action ||
+                        (chap.keyFacts && chap.keyFacts[0]);
+                      if (!actionText) return null;
+                      return (
+                        <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-neutral-900/90 border border-purple-800/40 text-purple-200">
+                          <Compass className="w-3.5 h-3.5 text-purple-400 mt-0.5 shrink-0" />
+                          <div className="space-y-0.5 text-xs min-w-0">
+                            <span className="text-[10px] uppercase font-bold tracking-wider text-purple-400 block">
+                              Действие автора / Выбор:
+                            </span>
+                            <p className="text-xs text-purple-100 font-medium italic break-words">
+                              «{actionText}»
+                            </p>
+                          </div>
+                        </div>
+                      );
+                    })()}
 
                     {chap.keyFacts && chap.keyFacts.length > 0 && (
                       <div className="pt-2 border-t border-neutral-900 flex flex-wrap gap-1.5">

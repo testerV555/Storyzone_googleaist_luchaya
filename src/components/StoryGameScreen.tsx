@@ -32,12 +32,14 @@ import {
   History,
   X,
   CheckCircle2,
+  Check,
   AlertCircle,
   Trophy,
   BookMarked,
   Edit3,
   GitBranch,
   Lightbulb,
+  RefreshCw,
   Compass,
   Bookmark,
   Network,
@@ -55,6 +57,9 @@ import {
   Minimize2,
   SkipBack,
   Eye,
+  Download,
+  Cloud,
+  Paperclip,
 } from "lucide-react";
 import { sound, TrackType } from "../utils/audio";
 import { safeFetchJson } from "../utils/safeApi";
@@ -75,7 +80,9 @@ import { StoryAiChatView } from "./StoryAiChatView";
 import { StoryAiChatDrawer } from "./StoryAiChatDrawer";
 import { StoryUniverseView } from "./StoryUniverseView";
 import { UniverseSettingModal } from "./UniverseSettingModal";
-import { TacticalComboChain, DivergencePayload, GenerationLength } from "../types";
+import { AgreementsLogModal } from "./AgreementsLogModal";
+import { WorldMapModal } from "./WorldMapModal";
+import { TacticalComboChain, DivergencePayload, GenerationLength, StoryChatMessage } from "../types";
 
 interface StoryGameScreenProps {
   gameState: ActiveGameState;
@@ -130,6 +137,21 @@ interface StoryGameScreenProps {
   onAddLorebookEntry?: (entry: LorebookEntry) => void;
   onRewindPreviousChapter?: () => void;
   onDeleteCurrentChapter?: () => void;
+  onForceUnlockLoading?: () => void;
+  onUpdateChatHistory?: (messages: StoryChatMessage[]) => void;
+  onOpenCloudSync?: () => void;
+  onOpenMediaAttachment?: () => void;
+  onToggleAuthorDictateMode?: (enabled: boolean) => void;
+  onToggleStrictActionFidelity?: (enabled: boolean) => void;
+  onToggleProportionalActionScaling?: (enabled: boolean) => void;
+  onAddCoAuthorAgreement?: (agreement: any) => void;
+  onRemoveCoAuthorAgreement?: (id: string) => void;
+  onUpdateCoAuthorAgreement?: (agreement: any) => void;
+  onToggleCoAuthorMode?: (enabled: boolean) => void;
+  onAcceptPendingStep?: () => void;
+  onRejectPendingStep?: () => void;
+  onOpenAgreementsModal?: () => void;
+  onOpenWorldMap?: () => void;
 }
 
 const THEME_CLASSES: Record<
@@ -188,6 +210,189 @@ const FOCUS_LABELS: Record<SceneFocus, { label: string; icon: string }> = {
   exploration: { label: "Исследование & Лор", icon: "🔍" },
 };
 
+// Isolated CustomActionInput component: handles fast typing with 0 re-renders of the main screen
+interface CustomActionInputProps {
+  isLoading: boolean;
+  isZenMode: boolean;
+  onSubmit: (action: string) => void;
+  onOpenMediaAttachment?: () => void;
+  attachedMediaCount?: number;
+  hasPendingStep?: boolean;
+  isCoAuthorMode?: boolean;
+  onAcceptPlot?: () => void;
+  onRejectPlot?: () => void;
+}
+
+const CustomActionInput: React.FC<CustomActionInputProps> = React.memo(({
+  isLoading,
+  isZenMode,
+  onSubmit,
+  onOpenMediaAttachment,
+  attachedMediaCount = 0,
+  hasPendingStep = false,
+  isCoAuthorMode = false,
+  onAcceptPlot,
+  onRejectPlot,
+}) => {
+  const [text, setText] = useState("");
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!text.trim() || isLoading) return;
+    onSubmit(text.trim());
+    setText("");
+  };
+
+  return (
+    <div className="space-y-2">
+      <form onSubmit={handleSubmit} className="pt-3 relative flex flex-col gap-2">
+        <div className="relative w-full">
+          <textarea
+            id="input-custom-action"
+            rows={text.length > 80 || text.includes("\n") ? 3 : 2}
+            value={text}
+            disabled={isLoading}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                handleSubmit(e);
+              }
+            }}
+            placeholder={
+              hasPendingStep
+                ? "Новый ответ ожидает вашего подтверждения: нажмите «Принять сюжет» справа или введите уточняющее действие..."
+                : "Свободное действие любого объёма: детальный поступок, развёрнутые реплики диалога, тактический манёвр, применение заклинаний или поворот сюжета..."
+            }
+            className="w-full bg-neutral-900/95 border border-purple-900/50 hover:border-purple-600/80 rounded-xl pl-4 pr-32 sm:pr-40 py-2.5 text-xs sm:text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 shadow-lg shadow-purple-950/20 resize-y min-h-[52px] max-h-48 transition-all"
+          />
+          <div className="absolute right-2 bottom-2.5 flex items-center gap-1.5">
+            {/* Direct Accept Plot button in co-author mode or whenever pending step is awaiting confirmation */}
+            {(hasPendingStep || isCoAuthorMode) && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!hasPendingStep) return;
+                  sound.playAction("magic");
+                  onAcceptPlot?.();
+                }}
+                disabled={isLoading || !hasPendingStep}
+                id="btn-accept-plot-action"
+                className={`px-2.5 py-1.5 rounded-lg text-white text-xs font-bold shadow-md flex items-center gap-1 transition-all active:scale-95 ${
+                  hasPendingStep
+                    ? "bg-gradient-to-r from-amber-600 to-purple-600 hover:from-amber-500 hover:to-purple-500 shadow-amber-950/40 animate-pulse cursor-pointer"
+                    : "bg-neutral-800 text-neutral-500 cursor-not-allowed border border-neutral-700/60"
+                }`}
+                title={
+                  hasPendingStep
+                    ? "Принять сюжет: официально утвердить сгенерированный ход соавтора в канон истории"
+                    : "Режим соавтора: кнопка «Принять сюжет» станет активна сразу после генерации нового ответа ИИ"
+                }
+              >
+                <Check className={`w-3.5 h-3.5 ${hasPendingStep ? "text-amber-200" : "text-neutral-500"}`} />
+                <span className="hidden sm:inline">Принять сюжет</span>
+                <span className="sm:hidden">Принять</span>
+              </button>
+            )}
+
+            <button
+              type="submit"
+              disabled={!text.trim() || isLoading}
+              id="btn-submit-custom-action"
+              className="p-2 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:bg-neutral-800 text-white disabled:text-neutral-500 transition-colors shadow-md"
+              title="Воплотить действие автора в истории (Enter — отправить, Shift+Enter — перенос строки)"
+            >
+              <Send className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+
+        {text.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] px-1 text-neutral-400">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-purple-300 flex items-center gap-1 font-medium">
+                <span>⚡</span>
+                {text.length > 350 ? (
+                  <span className="text-amber-300 font-semibold">
+                    Эпический масштаб (x2.5+ объёма главы): ИИ подробно распишет каждый поворот и диалог!
+                  </span>
+                ) : text.length > 150 ? (
+                  <span className="text-emerald-300 font-semibold">
+                    Развёрнутое действие (x1.5+ объёма): глава пропорционально увеличится под ваш замысел!
+                  </span>
+                ) : (
+                  "Строгое соблюдение замысла: ИИ воплотит действие без искажений"
+                )}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 font-mono text-[10px]">
+              <span className="text-neutral-400">Слов: {text.trim().split(/\s+/).filter(Boolean).length}</span>
+              <span className="text-neutral-500">Символов: {text.length}</span>
+              {text.length > 150 && (
+                <span className="px-1.5 py-0.5 rounded bg-amber-950 border border-amber-800 text-amber-300 font-bold">
+                  Авто-масштаб главы: ВКЛ
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+      </form>
+
+      {/* Media Attachment Action Trigger */}
+      {onOpenMediaAttachment && (
+        <div className="flex items-center gap-2 pt-0.5">
+          <button
+            type="button"
+            onClick={() => {
+              sound.playClick();
+              onOpenMediaAttachment();
+            }}
+            className="px-2.5 py-1 rounded-xl bg-purple-950/70 hover:bg-purple-900 border border-purple-800/80 text-purple-200 text-xs font-semibold flex items-center gap-1.5 transition-all shadow-sm"
+            title="Прикрепить файл или фото позы, голос персонажа, сценарий к ходу (+)"
+          >
+            <Paperclip className="w-3.5 h-3.5 text-purple-400" />
+            <span>+ Прикрепить файл / медиа</span>
+            {attachedMediaCount > 0 && (
+              <span className="px-1.5 py-0.2 rounded-full bg-purple-600 text-[10px] text-white font-mono font-bold">
+                {attachedMediaCount}
+              </span>
+            )}
+          </button>
+        </div>
+      )}
+
+      {!isZenMode && (
+        <div className="space-y-1.5 pt-1">
+          <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-neutral-400">
+            <span className="text-neutral-500 text-[10px]">Идеи автора:</span>
+            {[
+              "Внезапный поворот сюжета: раскрывается тайна...",
+              "Появление нового персонажа: из тени шагает путник...",
+              "Изменение мира: реальность вокруг трансформируется...",
+              "Использовать скрытую магию или решительный выпад...",
+              "Обратиться к спутникам и изменить маршрут...",
+            ].map((hint, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => setText(hint)}
+                className="px-2 py-0.5 rounded-full bg-neutral-900/80 hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 border border-neutral-800 text-[10px] transition-colors"
+              >
+                + {hint}
+              </button>
+            ))}
+          </div>
+
+          <div className="text-[10px] text-purple-400/80 flex items-center gap-1.5 pl-1">
+            <span>✨</span>
+            <span>Всё, что вы напишете в строку, безоговорочно воплощается ИИ в истории с сохранением памяти всех прошлых глав.</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+
 export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
   gameState,
   onExecuteChoice,
@@ -226,9 +431,24 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
   onAddLorebookEntry,
   onRewindPreviousChapter,
   onDeleteCurrentChapter,
+  onForceUnlockLoading,
+  onUpdateChatHistory,
+  onOpenCloudSync,
+  onOpenMediaAttachment,
+  onToggleAuthorDictateMode,
+  onToggleStrictActionFidelity,
+  onToggleProportionalActionScaling,
+  onAddCoAuthorAgreement,
+  onRemoveCoAuthorAgreement,
+  onUpdateCoAuthorAgreement,
+  onToggleCoAuthorMode,
+  onAcceptPendingStep,
+  onRejectPendingStep,
+  onOpenAgreementsModal,
+  onOpenWorldMap,
 }) => {
   const [activeGameView, setActiveGameView] = useState<
-    "story" | "journal" | "relationships" | "chat" | "universe"
+    "story" | "journal" | "relationships" | "chat" | "universe" | "map"
   >("story");
   const [isZenMode, setIsZenMode] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -241,7 +461,6 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
   const [currentGenLength, setCurrentGenLength] = useState<"short" | "medium" | "long">(
     gameState.generationLength || "medium"
   );
-  const [customActionText, setCustomActionText] = useState("");
   const [showInventory, setShowInventory] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [editingTargetStep, setEditingTargetStep] = useState<number | null>(null);
@@ -262,6 +481,8 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
   const [showExportImportModal, setShowExportImportModal] = useState(false);
   const [showTacticalModal, setShowTacticalModal] = useState(false);
   const [showDivergenceModal, setShowDivergenceModal] = useState(false);
+  const [showAgreementsModal, setShowAgreementsModal] = useState(false);
+  const [showWorldMapModal, setShowWorldMapModal] = useState(false);
 
   const handleEnrichCharacter = async (char: Character) => {
     try {
@@ -367,14 +588,6 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
     sceneEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [gameState.stepCount, gameState.currentScene]);
 
-  const handleCustomSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!customActionText.trim() || gameState.isLoading) return;
-    sound.playChoice();
-    onExecuteCustomAction(customActionText.trim());
-    setCustomActionText("");
-  };
-
   const toggleTTS = () => {
     if (isSpeaking) {
       sound.stopSpeaking();
@@ -401,7 +614,11 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
   };
 
   const activeSpeakerChar = gameState.characters.find(
-    (c) => c.name.toLowerCase() === gameState.dialogueSpeaker?.toLowerCase()
+    (c) =>
+      c &&
+      c.name &&
+      gameState.dialogueSpeaker &&
+      c.name.toLowerCase().trim() === gameState.dialogueSpeaker.toLowerCase().trim()
   );
 
   return (
@@ -626,6 +843,26 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
                   Лор
                 </span>
               </button>
+
+              <button
+                id="btn-view-world-map"
+                onClick={() => {
+                  sound.playClick();
+                  setActiveGameView("map");
+                }}
+                className={`px-2 sm:px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all ${
+                  activeGameView === "map"
+                    ? "bg-amber-600 text-white shadow-sm"
+                    : "text-neutral-400 hover:text-neutral-200"
+                }`}
+                title="Интерактивная карта мира (D3): каноничные регионы, пройденный маршрут и будущие развилки"
+              >
+                <Compass className="w-3.5 h-3.5 text-amber-400" />
+                <span className="hidden sm:inline">Карта мира</span>
+                <span className="text-[10px] px-1 rounded-full bg-amber-950 text-amber-300 font-mono border border-amber-800">
+                  D3
+                </span>
+              </button>
             </div>
 
             {/* Auto-Save indicator */}
@@ -662,6 +899,122 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
               <span className="text-[10px] px-1 rounded-full bg-purple-900 text-purple-200">
                 {gameState.memoryChapters.length}
               </span>
+            </button>
+
+            {/* Cloud Sync & Phone Transfer Button */}
+            {onOpenCloudSync && (
+              <button
+                id="btn-cloud-sync"
+                onClick={() => {
+                  sound.playClick();
+                  onOpenCloudSync();
+                }}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-purple-950/70 hover:bg-purple-900 border border-purple-800/80 text-purple-200 text-xs font-semibold shadow-sm transition-all"
+                title="Облачная синхронизация & перенос на телефон по коду или email"
+              >
+                <Cloud className="w-3.5 h-3.5 text-purple-400" />
+                <span className="hidden sm:inline">Облако</span>
+              </button>
+            )}
+
+            {/* Media Attachment & File Lab Button */}
+            {onOpenMediaAttachment && (
+              <button
+                id="btn-game-media-attachments"
+                onClick={() => {
+                  sound.playClick();
+                  onOpenMediaAttachment();
+                }}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-purple-950/70 hover:bg-purple-900 border border-purple-800/80 text-purple-200 text-xs font-semibold shadow-sm transition-all"
+                title="Медиатека & Прикрепление файлов любых форматов (+): фото поз/внешности, аудио голоса персонажей, видео, сценарии, тексты"
+              >
+                <Paperclip className="w-3.5 h-3.5 text-purple-400" />
+                <span className="hidden sm:inline">+ Файлы</span>
+                {(gameState.attachedMedia?.length || 0) > 0 && (
+                  <span className="text-[10px] px-1 rounded-full bg-purple-800 text-purple-200 font-mono">
+                    {gameState.attachedMedia?.length}
+                  </span>
+                )}
+              </button>
+            )}
+
+            {/* Co-Author Mode Toggle Button in HUD */}
+            {onToggleCoAuthorMode && (
+              <button
+                id="btn-hud-coauthor-mode"
+                onClick={() => {
+                  sound.playClick();
+                  const next = !Boolean(gameState.coAuthorMode);
+                  onToggleCoAuthorMode(next);
+                }}
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold shadow-sm transition-all ${
+                  gameState.coAuthorMode
+                    ? "bg-purple-950/90 border-purple-500 text-purple-200 ring-1 ring-purple-500/50 shadow-purple-950/40"
+                    : "bg-neutral-900/90 hover:bg-neutral-800 border-neutral-800 text-neutral-400 hover:text-neutral-200"
+                }`}
+                title={
+                  gameState.coAuthorMode
+                    ? "Режим соавтора: ВКЛ (ИИ запрашивает одобрение перед добавлением ответа в историю)"
+                    : "Включить Режим соавтора (Co-Author Mode: подтверждение каждого сгенерированного ответа)"
+                }
+              >
+                <Bot className={`w-3.5 h-3.5 ${gameState.coAuthorMode ? "text-purple-400 animate-pulse" : "text-neutral-400"}`} />
+                <span className="hidden md:inline">
+                  {gameState.coAuthorMode ? "Соавтор: ВКЛ" : "Режим соавтора"}
+                </span>
+                <span className="md:hidden">
+                  {gameState.coAuthorMode ? "Соавтор" : "Соавтор"}
+                </span>
+              </button>
+            )}
+
+            {/* Agreements Log (Согласованные детали) Button in HUD */}
+            <button
+              id="btn-hud-agreements-log"
+              onClick={() => {
+                sound.playClick();
+                if (onOpenAgreementsModal) {
+                  onOpenAgreementsModal();
+                } else {
+                  setShowAgreementsModal(true);
+                }
+              }}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-amber-950/60 hover:bg-amber-900/60 border border-amber-800/60 text-amber-300 text-xs font-semibold shadow-sm transition-all"
+              title="Открыть Согласованные детали (Agreements Log) — факты, которые ИИ помнит и соблюдает навсегда"
+            >
+              <Bookmark className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden sm:inline">Договорённости</span>
+              <span className="text-[10px] px-1 rounded-full bg-amber-900 text-amber-200 font-mono">
+                {(gameState.coAuthorAgreements || []).length}
+              </span>
+            </button>
+
+            {/* Interactive World Map Modal Button */}
+            <button
+              id="btn-hud-world-map"
+              onClick={() => {
+                sound.playClick();
+                setShowWorldMapModal(true);
+              }}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-amber-950/70 hover:bg-amber-900/80 border border-amber-600/60 text-amber-300 text-xs font-semibold shadow-sm transition-all"
+              title="Открыть Интерактивную Карту Мира (D3: канон, пройденный маршрут и будущие развилки)"
+            >
+              <span>🗺️</span>
+              <span className="hidden sm:inline">Карта</span>
+            </button>
+
+            {/* Direct Export & Archive Button */}
+            <button
+              id="btn-export-story"
+              onClick={() => {
+                sound.playClick();
+                setShowExportImportModal(true);
+              }}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-neutral-900 hover:bg-purple-950/70 border border-neutral-800 hover:border-purple-800/60 text-neutral-300 hover:text-purple-200 text-xs font-semibold shadow-sm transition-all"
+              title="Экспорт всей истории, глав, обсуждений и принятых правок соавтора"
+            >
+              <Download className="w-3.5 h-3.5 text-purple-400" />
+              <span className="hidden sm:inline">Экспорт</span>
             </button>
 
             {/* Universe & Setting Inspector Button */}
@@ -990,6 +1343,27 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
             setTimeout(() => setNotification(null), 3500);
           }}
           onOpenUniverseModal={() => setShowUniverseModal(true)}
+          onUpdateChatHistory={onUpdateChatHistory}
+          onOpenCloudSync={onOpenCloudSync}
+          onOpenMediaAttachment={onOpenMediaAttachment}
+          onToggleAuthorDictateMode={onToggleAuthorDictateMode}
+          onToggleStrictActionFidelity={onToggleStrictActionFidelity}
+          onToggleProportionalActionScaling={onToggleProportionalActionScaling}
+          onAddCoAuthorAgreement={onAddCoAuthorAgreement}
+          onRemoveCoAuthorAgreement={onRemoveCoAuthorAgreement}
+          onUpdateCoAuthorAgreement={onUpdateCoAuthorAgreement}
+        />
+      ) : activeGameView === "map" ? (
+        <WorldMapModal
+          isOpen={true}
+          isEmbeddedSection={true}
+          onClose={() => {
+            sound.playClick();
+            setActiveGameView("story");
+          }}
+          gameState={gameState}
+          onExecuteAction={onExecuteCustomAction}
+          onAddLorebookEntry={onAddLorebookEntry}
         />
       ) : activeGameView === "universe" ? (
         <StoryUniverseView
@@ -1428,15 +1802,97 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
             </div>
           )}
 
+          {/* Co-Author Mode Pending Step Review & Confirmation Banner */}
+          {gameState.pendingStep && (
+            <div className="mt-5 p-4 sm:p-5 rounded-2xl bg-gradient-to-r from-amber-950/80 via-neutral-900 to-purple-950/80 border-2 border-amber-500/80 shadow-2xl text-xs space-y-3 animate-fade-in">
+              <div className="flex items-center justify-between gap-2 border-b border-amber-500/40 pb-2.5">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 rounded-lg bg-amber-500/20 border border-amber-500/60 text-amber-300">
+                    <Bot className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h4 className="font-cinzel text-xs sm:text-sm font-bold text-amber-200">
+                      Режим соавтора: Сюжетный ход ожидает подтверждения
+                    </h4>
+                    <span className="text-[10px] text-amber-400 font-mono">
+                      Действие: «{gameState.pendingStep.actionLabel}»
+                    </span>
+                  </div>
+                </div>
+
+                <span className="px-2 py-0.5 rounded-full bg-amber-950 text-[10px] font-bold text-amber-300 border border-amber-700 font-mono animate-pulse">
+                  Ожидает одобрения
+                </span>
+              </div>
+
+              <div className="p-3 rounded-xl bg-neutral-950/90 border border-neutral-800 text-neutral-200 space-y-1.5 leading-relaxed">
+                <span className="text-[10px] uppercase font-bold text-neutral-400 block tracking-wider">
+                  Предложенный ИИ фрагмент главы:
+                </span>
+                <p className="whitespace-pre-line text-xs sm:text-sm text-neutral-100 italic font-story">
+                  {gameState.pendingStep.response.sceneText}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                <span className="text-[11px] text-neutral-400">
+                  Нажмите <strong>«Принять сюжет»</strong>, чтобы официально добавить этот ход в канон истории.
+                </span>
+
+                <div className="flex items-center gap-2">
+                  {onRejectPendingStep && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playClick();
+                        onRejectPendingStep();
+                      }}
+                      className="px-3 py-1.5 rounded-xl bg-neutral-850 hover:bg-neutral-800 border border-neutral-700 text-neutral-300 hover:text-white text-xs font-semibold transition-all"
+                    >
+                      Отклонить вариант
+                    </button>
+                  )}
+
+                  {onAcceptPendingStep && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        sound.playAction("magic");
+                        onAcceptPendingStep();
+                      }}
+                      className="px-4 py-2 rounded-xl bg-gradient-to-r from-amber-600 to-purple-600 hover:from-amber-500 hover:to-purple-500 text-white text-xs font-bold shadow-lg shadow-amber-950/50 flex items-center gap-1.5 transition-all hover:scale-105 active:scale-95"
+                    >
+                      <Check className="w-4 h-4 text-amber-200" />
+                      <span>Принять сюжет в историю</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           <div ref={sceneEndRef} />
 
-          {/* AI Game Master Thinking Indicator */}
+          {/* AI Game Master Thinking Indicator with Emergency Unlock */}
           {gameState.isLoading && (
-            <div className="flex items-center gap-3 py-4 px-5 rounded-xl bg-purple-950/40 border border-purple-800/40 text-purple-200 text-xs animate-pulse">
-              <Sparkles className="w-4 h-4 text-purple-400 animate-spin" />
-              <span>
-                ИИ Game Master осмысляет ваши действия и ткёт нити сюжета...
-              </span>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 py-3.5 px-4 sm:px-5 rounded-xl bg-purple-950/50 border border-purple-700/50 text-purple-200 text-xs shadow-lg">
+              <div className="flex items-center gap-3">
+                <Sparkles className="w-4 h-4 text-purple-400 animate-spin shrink-0" />
+                <span className="animate-pulse">
+                  ИИ Game Master осмысляет ваши действия и ткёт нити сюжета...
+                </span>
+              </div>
+              {onForceUnlockLoading && (
+                <button
+                  type="button"
+                  onClick={onForceUnlockLoading}
+                  className="self-end sm:self-auto px-3 py-1 text-[11px] font-medium rounded-lg bg-neutral-900/90 hover:bg-neutral-800 text-purple-200 hover:text-white border border-purple-750 transition-all flex items-center gap-1.5 shadow-sm active:scale-95"
+                  title="Снять зависание и восстановить управление"
+                >
+                  <RefreshCw className="w-3 h-3 text-purple-400" />
+                  <span>Сбросить загрузку</span>
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -1559,80 +2015,21 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
               })}
             </div>
 
-            {/* Custom Action Form with Multiline & Large Action Support */}
-            <form
-              onSubmit={handleCustomSubmit}
-              className="pt-3 relative flex flex-col gap-2"
-            >
-              <div className="relative w-full">
-                <textarea
-                  id="input-custom-action"
-                  rows={customActionText.length > 80 || customActionText.includes("\n") ? 3 : 2}
-                  value={customActionText}
-                  disabled={gameState.isLoading}
-                  onChange={(e) => setCustomActionText(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      handleCustomSubmit(e);
-                    }
-                  }}
-                  placeholder="Свободное действие любого объёма: детальный поступок, развёрнутые реплики диалога, тактический манёвр, применение заклинаний или поворот сюжета..."
-                  className="w-full bg-neutral-900/95 border border-purple-900/50 hover:border-purple-600/80 rounded-xl pl-4 pr-12 py-2.5 text-xs sm:text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 shadow-lg shadow-purple-950/20 resize-y min-h-[52px] max-h-48 transition-all"
-                />
-                <button
-                  type="submit"
-                  disabled={!customActionText.trim() || gameState.isLoading}
-                  id="btn-submit-custom-action"
-                  className="absolute right-2.5 bottom-3 p-2 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:bg-neutral-800 text-white disabled:text-neutral-500 transition-colors shadow-md"
-                  title="Воплотить действие автора в истории (Enter — отправить, Shift+Enter — перенос строки)"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
-              </div>
-
-              {customActionText.length > 0 && (
-                <div className="flex items-center justify-between text-[11px] px-1 text-neutral-400">
-                  <span className="text-purple-300 flex items-center gap-1">
-                    <span>⚡</span>
-                    {customActionText.length > 150 ? "Развёрнутое действие: ИИ детально воплотит каждый пункт!" : "Нажмите Enter для отправки, Shift+Enter для новой строки"}
-                  </span>
-                  <span className="text-neutral-500 font-mono text-[10px]">
-                    Символов: {customActionText.length}
-                  </span>
-                </div>
-              )}
-            </form>
-
-            {/* Quick Inspiration Chips & Creative Omnipotence Note */}
-            {!isZenMode && (
-              <div className="space-y-1.5 pt-1">
-                <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-neutral-400">
-                  <span className="text-neutral-500 text-[10px]">Идеи автора:</span>
-                  {[
-                    "Внезапный поворот сюжета: раскрывается тайна...",
-                    "Появление нового персонажа: из тени шагает путник...",
-                    "Изменение мира: реальность вокруг трансформируется...",
-                    "Использовать скрытую магию или решительный выпад...",
-                    "Обратиться к спутникам и изменить маршрут...",
-                  ].map((hint, i) => (
-                    <button
-                      key={i}
-                      type="button"
-                      onClick={() => setCustomActionText(hint)}
-                      className="px-2 py-0.5 rounded-full bg-neutral-900/80 hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 border border-neutral-800 text-[10px] transition-colors"
-                    >
-                      + {hint}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="text-[10px] text-purple-400/80 flex items-center gap-1.5 pl-1">
-                  <span>✨</span>
-                  <span>Всё, что вы напишете в строку, безоговорочно воплощается ИИ в истории с сохранением памяти всех прошлых глав.</span>
-                </div>
-              </div>
-            )}
+            {/* Custom Action Form with Multiline & Large Action Support - Isolated for zero-latency typing */}
+            <CustomActionInput
+              isLoading={gameState.isLoading}
+              isZenMode={isZenMode}
+              onSubmit={(action) => {
+                sound.playChoice();
+                onExecuteCustomAction(action);
+              }}
+              onOpenMediaAttachment={onOpenMediaAttachment}
+              attachedMediaCount={gameState.attachedMedia?.length || 0}
+              hasPendingStep={Boolean(gameState.pendingStep)}
+              isCoAuthorMode={Boolean(gameState.coAuthorMode)}
+              onAcceptPlot={onAcceptPendingStep}
+              onRejectPlot={onRejectPendingStep}
+            />
           </div>
         )}
       </div>
@@ -1645,6 +2042,7 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
         memoryChapters={gameState.memoryChapters}
         lorebook={gameState.lorebook}
         characters={gameState.characters}
+        history={gameState.history}
         storyTitle={gameState.story.title}
         customApiKey={customApiKey}
       />
@@ -1667,6 +2065,7 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
         }
         storyTitle={gameState.story.title}
         customApiKey={customApiKey}
+        coAuthorAgreements={gameState.coAuthorAgreements || []}
         currentChoices={
           editingTargetStep === null || editingTargetStep === gameState.stepCount
             ? gameState.currentChoices
@@ -1711,7 +2110,7 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
         currentScene={gameState.currentScene}
         characters={gameState.characters}
         customApiKey={customApiKey}
-        onApplySuggestion={(suggestion) => setCustomActionText(suggestion)}
+        onApplySuggestion={(suggestion) => onExecuteCustomAction(suggestion)}
       />
 
       {/* Relationship Graph & Matrix Modal */}
@@ -1773,6 +2172,7 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
           }
         }}
         customApiKey={customApiKey}
+        aiPromptDirective={aiPromptDirective}
       />
 
       {/* Tactical Combat Stance & Minigames Modal */}
@@ -1875,6 +2275,21 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
                           )}
                         </div>
                       </div>
+
+                      {/* Explicit Action Banner */}
+                      {step.action && (
+                        <div className="my-2 px-3 py-1.5 rounded-lg bg-neutral-900/90 border border-purple-800/40 text-purple-200 flex items-start gap-2 text-xs">
+                          <Compass className="w-3.5 h-3.5 text-purple-400 mt-0.5 shrink-0" />
+                          <div className="space-y-0.5 min-w-0">
+                            <span className="text-[10px] uppercase font-bold tracking-wider text-purple-400 block">
+                              Выбранное действие / ход:
+                            </span>
+                            <span className="text-purple-100 font-medium italic break-words">
+                              «{step.action}»
+                            </span>
+                          </div>
+                        </div>
+                      )}
 
                       {/* Scene Text Preview */}
                       <p className="text-xs text-neutral-300 py-2.5 font-serif line-clamp-4 leading-relaxed whitespace-pre-line">
@@ -2026,6 +2441,15 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
           setTimeout(() => setNotification(null), 3500);
         }}
         onOpenUniverseModal={() => setShowUniverseModal(true)}
+        onUpdateChatHistory={onUpdateChatHistory}
+        onOpenCloudSync={onOpenCloudSync}
+        onOpenMediaAttachment={onOpenMediaAttachment}
+        onToggleAuthorDictateMode={onToggleAuthorDictateMode}
+        onToggleStrictActionFidelity={onToggleStrictActionFidelity}
+        onToggleProportionalActionScaling={onToggleProportionalActionScaling}
+        onAddCoAuthorAgreement={onAddCoAuthorAgreement}
+        onRemoveCoAuthorAgreement={onRemoveCoAuthorAgreement}
+        onUpdateCoAuthorAgreement={onUpdateCoAuthorAgreement}
       />
 
       {/* Universe & Setting Modal with Google Search Grounding */}
@@ -2098,6 +2522,32 @@ export const StoryGameScreen: React.FC<StoryGameScreenProps> = ({
           </div>
         </div>
       )}
+
+      {/* Agreements Log Modal (Согласованные детали сюжета) */}
+      <AgreementsLogModal
+        isOpen={showAgreementsModal}
+        onClose={() => setShowAgreementsModal(false)}
+        agreements={gameState.coAuthorAgreements || []}
+        onAddAgreement={(agreement) => {
+          if (onAddCoAuthorAgreement) {
+            onAddCoAuthorAgreement(agreement);
+          }
+        }}
+        onRemoveAgreement={(id) => {
+          if (onRemoveCoAuthorAgreement) {
+            onRemoveCoAuthorAgreement(id);
+          }
+        }}
+      />
+
+      {/* D3 World Map Interactive Modal */}
+      <WorldMapModal
+        isOpen={showWorldMapModal}
+        onClose={() => setShowWorldMapModal(false)}
+        gameState={gameState}
+        onExecuteAction={onExecuteCustomAction}
+        onAddLorebookEntry={onAddLorebookEntry}
+      />
     </div>
   );
 };

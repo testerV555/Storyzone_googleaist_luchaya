@@ -23,6 +23,9 @@ import {
   Compass,
   Globe,
   Scroll,
+  Volume2,
+  VolumeX,
+  Paperclip,
 } from "lucide-react";
 import { sound } from "../utils/audio";
 import { safeFetchJson } from "../utils/safeApi";
@@ -33,6 +36,7 @@ interface CharactersModalProps {
   onUpdateCharacter?: (updatedChar: Character) => void;
   onAddCharacter?: (newChar: Character) => void;
   customApiKey?: string;
+  onOpenMediaAttachment?: () => void;
 }
 
 export const CharactersModal: React.FC<CharactersModalProps> = ({
@@ -41,6 +45,7 @@ export const CharactersModal: React.FC<CharactersModalProps> = ({
   onUpdateCharacter,
   onAddCharacter,
   customApiKey,
+  onOpenMediaAttachment,
 }) => {
   const [selectedChar, setSelectedChar] = useState<Character | null>(
     characters[0] || null
@@ -717,6 +722,85 @@ export const CharactersModal: React.FC<CharactersModalProps> = ({
                       </p>
                     </div>
                   )}
+
+                  {/* Character Voice & Audio Profile Card */}
+                  <div className="p-3.5 rounded-xl bg-neutral-950/80 border border-neutral-800 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-neutral-300 flex items-center gap-1.5">
+                        <Volume2 className="w-3.5 h-3.5 text-amber-400" />
+                        Голос персонажа & Аудио-референс:
+                      </span>
+                      {onOpenMediaAttachment && (
+                        <button
+                          onClick={() => {
+                            sound.playClick();
+                            onOpenMediaAttachment();
+                          }}
+                          className="px-2 py-0.5 rounded-lg bg-purple-950/80 hover:bg-purple-900 border border-purple-800 text-[10px] text-purple-200 font-semibold flex items-center gap-1"
+                        >
+                          <Paperclip className="w-3 h-3 text-purple-400" />
+                          <span>Прикрепить файл / Записать (+)</span>
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-lg bg-neutral-900 border border-neutral-850">
+                      <div>
+                        <span className="text-xs font-bold text-amber-200 block">
+                          {selectedChar.voiceTimbre || "Характерный голос"}
+                        </span>
+                        <span className="text-[10px] text-neutral-400 font-mono">
+                          Высота: {selectedChar.voicePitch ?? 1.0}x | Скорость: {selectedChar.voiceRate ?? 1.0}x
+                          {selectedChar.voiceSampleUrl ? " • Загружен аудиофайл" : " • Синтез речи (TTS)"}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => {
+                            sound.playClick();
+                            const sampleText = `Приветствую. Моё имя — ${selectedChar.name}. Я готов к нашему следующему шагу.`;
+                            sound.speakCharacter(sampleText, selectedChar);
+                          }}
+                          className="px-3 py-1 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold flex items-center gap-1 shadow-md transition-all hover:scale-105"
+                          title="Прослушать образец звучания голоса персонажа"
+                        >
+                          <Volume2 className="w-3.5 h-3.5" />
+                          <span>Прослушать голос</span>
+                        </button>
+                        <button
+                          onClick={() => {
+                            sound.stopSpeaking();
+                          }}
+                          className="p-1 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-white"
+                          title="Остановить воспроизведение"
+                        >
+                          <VolumeX className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Pose and Appearance Reference if present */}
+                    {(selectedChar.poseDescription || selectedChar.poseReferenceUrl) && (
+                      <div className="p-2.5 rounded-lg bg-neutral-900 border border-neutral-850 space-y-1">
+                        <span className="text-[11px] font-semibold text-purple-300 block">
+                          Текущая поза персонажа в сцене:
+                        </span>
+                        <div className="flex items-center gap-3">
+                          {selectedChar.poseReferenceUrl && (
+                            <img
+                              src={selectedChar.poseReferenceUrl}
+                              alt="Поза"
+                              className="w-12 h-12 rounded-lg object-cover border border-purple-800 shrink-0"
+                            />
+                          )}
+                          <p className="text-xs text-neutral-300">
+                            {selectedChar.poseDescription || "Особая боевая или сюжетная поза"}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
 
                   {/* Bio */}
                   <div className="space-y-1">

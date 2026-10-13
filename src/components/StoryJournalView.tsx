@@ -562,6 +562,31 @@ export const StoryJournalView: React.FC<StoryJournalViewProps> = ({
                         </button>
                       </div>
 
+                      {/* Action taken / choice made */}
+                      {(() => {
+                        const matchingHistory = gameState.history.find(
+                          (h) => h.stepNumber === chapter.chapterNumber
+                        );
+                        const actionText =
+                          chapter.chosenAction ||
+                          matchingHistory?.action ||
+                          (chapter.keyFacts && chapter.keyFacts[0]);
+                        if (!actionText) return null;
+                        return (
+                          <div className="flex items-start gap-2.5 p-3 rounded-xl bg-purple-950/30 border border-purple-800/40 text-purple-200">
+                            <Compass className="w-4 h-4 text-purple-400 mt-0.5 shrink-0" />
+                            <div className="space-y-0.5 min-w-0">
+                              <span className="text-[10px] uppercase font-bold tracking-wider text-purple-400 block">
+                                Предпринятое действие / ход автора:
+                              </span>
+                              <p className="text-xs sm:text-sm text-purple-100 font-medium italic break-words">
+                                «{actionText}»
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
                       {/* Literary Summary */}
                       <p className="text-xs sm:text-sm text-neutral-200 leading-relaxed font-serif">
                         {chapter.summary}

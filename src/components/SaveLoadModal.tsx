@@ -11,6 +11,7 @@ import {
   Zap,
   Coins,
   Shield,
+  Cloud,
 } from "lucide-react";
 import { sound } from "../utils/audio";
 
@@ -21,6 +22,7 @@ interface SaveLoadModalProps {
   onDeleteSave: (slotId: string) => void;
   hasActiveGame: boolean;
   onImportSaves: (jsonString: string) => void;
+  onOpenCloudSync?: () => void;
 }
 
 export const SaveLoadModal: React.FC<SaveLoadModalProps> = ({
@@ -30,6 +32,7 @@ export const SaveLoadModal: React.FC<SaveLoadModalProps> = ({
   onDeleteSave,
   hasActiveGame,
   onImportSaves,
+  onOpenCloudSync,
 }) => {
   const handleExport = () => {
     const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(saves, null, 2));
@@ -70,6 +73,20 @@ export const SaveLoadModal: React.FC<SaveLoadModalProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
+          {onOpenCloudSync && (
+            <button
+              onClick={() => {
+                sound.playClick();
+                onOpenCloudSync();
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-purple-900/90 to-indigo-900/90 hover:from-purple-800 hover:to-indigo-800 border border-purple-600/70 text-purple-200 text-xs font-semibold shadow-md shadow-purple-950/40 transition-all hover:scale-105"
+              title="Синхронизация с облаком и перенос на телефон по коду или аккаунту"
+            >
+              <Cloud className="w-3.5 h-3.5 text-purple-300" />
+              <span>Облако & Телефон</span>
+            </button>
+          )}
+
           <button
             onClick={handleExport}
             disabled={saves.length === 0}

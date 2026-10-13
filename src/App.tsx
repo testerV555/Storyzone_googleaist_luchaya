@@ -14,6 +14,8 @@ import {
   SceneFocus,
   Character,
   UniverseSetting,
+  MediaAttachment,
+  PlayerStats,
 } from "./types";
 import { PRESET_STORIES } from "./data/presets";
 import { Header } from "./components/Header";
@@ -29,7 +31,11 @@ import {
 } from "./components/SettingsModal";
 import { StoryExportImportModal } from "./components/StoryExportImportModal";
 import { InternetUniverseFinderModal } from "./components/InternetUniverseFinderModal";
-import { TacticalComboChain, DivergencePayload } from "./types";
+import { CloudSyncModal } from "./components/CloudSyncModal";
+import { MediaAttachmentModal } from "./components/MediaAttachmentModal";
+import { AccountModal } from "./components/AccountModal";
+import { WorldMapModal } from "./components/WorldMapModal";
+import { TacticalComboChain, DivergencePayload, UserAccountProfile, AccountDataSnapshot } from "./types";
 import { sound, TrackType } from "./utils/audio";
 import { safeFetchJson } from "./utils/safeApi";
 import {
@@ -55,6 +61,37 @@ export default function App() {
 
   const [isExportImportOpen, setIsExportImportOpen] = useState(false);
   const [isInternetFinderOpen, setIsInternetFinderOpen] = useState(false);
+  const [isCloudSyncOpen, setIsCloudSyncOpen] = useState(false);
+  const [isMediaAttachmentOpen, setIsMediaAttachmentOpen] = useState(false);
+  const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
+  const [isWorldMapModalOpen, setIsWorldMapModalOpen] = useState(false);
+
+  // User Account & Real-Time Cross-Device Cloud Sync State
+  const [currentUser, setCurrentUser] = useState<UserAccountProfile | null>(() => {
+    try {
+      const saved = localStorage.getItem("storyzone_current_user");
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return null;
+  });
+  const [autoSyncEnabled, setAutoSyncEnabled] = useState<boolean>(() => {
+    return localStorage.getItem("storyzone_auto_sync_enabled") !== "false";
+  });
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(() => {
+    const s = localStorage.getItem("storyzone_last_synced_at");
+    return s ? Number(s) : null;
+  });
+
+  // Check URL sync code on mount
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("syncCode") || params.get("accountKey")) {
+        setIsCloudSyncOpen(true);
+      }
+    } catch (e) {}
+  }, []);
 
   // Music BPM & Narrative pacing
   const [musicBpm, setMusicBpm] = useState<number>(() => {
@@ -134,6 +171,7 @@ export default function App() {
       DEFAULT_AI_SYSTEM_PROMPT
     );
   });
+  const [notification, setNotification] = useState<string | null>(null);
 
   // Check backend Gemini availability
   useEffect(() => {
@@ -203,6 +241,139 @@ export default function App() {
     } catch (e) {}
   }, [musicBpm]);
 
+  // Watchdog: If gameState.isLoading ever remains true for more than 28 seconds, automatically unlock it
+  useEffect(() => {
+    if (!gameState?.isLoading) return;
+
+    const timer = setTimeout(() => {
+      console.warn("[Watchdog] Resetting stuck isLoading state after timeout");
+      setGameState((prev) => (prev ? { ...prev, isLoading: false } : null));
+      setNotification("⚡ Ответ ИИ задержался. Состояние автоматически разблокировано, вы можете продолжить.");
+      setTimeout(() => setNotification(null), 5000);
+    }, 28000);
+
+    return () => clearTimeout(timer);
+  }, [gameState?.isLoading]);
+
+  // Manual emergency loading reset
+  const handleForceUnlockLoading = () => {
+    sound.playClick();
+    setGameState((prev) => (prev ? { ...prev, isLoading: false } : null));
+    setNotification("🔓 Загрузка сброшена. Управление историей разблокировано.");
+    setTimeout(() => setNotification(null), 3500);
+  };
+
+  // Build current comprehensive account snapshot (for multi-device sync)
+  const buildCurrentAccountSnapshot = (): AccountDataSnapshot => {
+    const customList = stories.filter((s) => s.isCustom);
+    const chatHistories: Record<string, any[]> = {};
+    if (gameState?.story?.id) {
+      try {
+        const c = localStorage.getItem(`storyzone_chat_${gameState.story.id}`);
+        if (c) chatHistories[gameState.story.id] = JSON.parse(c);
+      } catch (e) {}
+    }
+    return {
+      activeGameState: gameState,
+      saves,
+      customStories: customList,
+      chatHistories,
+      settings: {
+        readerTheme,
+        fontSize,
+        soundEnabled,
+        autoSituationMusic,
+        aiPromptDirective,
+        aiSystemPrompt,
+        ultraMemory,
+        customApiKey,
+      },
+      syncedAt: Date.now(),
+      stepCount: gameState?.stepCount || 1,
+      storyTitle: gameState?.story?.title || "Повесть",
+    };
+  };
+
+  // Force sync entire progress to user account
+  const handleForceSync = async (): Promise<boolean> => {
+    if (!currentUser) return false;
+    setIsSyncing(true);
+    try {
+      const snapshot = buildCurrentAccountSnapshot();
+      const res = await safeFetchJson<any>("/api/account/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: currentUser.email,
+          pinCode: currentUser.pinCode,
+          snapshot,
+          deviceName: navigator.userAgent.includes("Mobile") ? "Смартфон" : "Компьютер / ПК",
+        }),
+      });
+
+      if (res.ok && res.data?.success) {
+        const now = res.data.syncedAt || Date.now();
+        setLastSyncedAt(now);
+        localStorage.setItem("storyzone_last_synced_at", String(now));
+        setIsSyncing(false);
+        return true;
+      }
+    } catch (e) {
+      console.warn("Account sync failed:", e);
+    }
+    setIsSyncing(false);
+    return false;
+  };
+
+  // Continuous debounced auto-sync to account on any state or saves change
+  useEffect(() => {
+    if (!currentUser || !autoSyncEnabled) return;
+    const timer = setTimeout(() => {
+      handleForceSync();
+    }, 2800);
+    return () => clearTimeout(timer);
+  }, [gameState?.stepCount, gameState?.currentScene, gameState?.coAuthorAgreements, saves.length, currentUser, autoSyncEnabled]);
+
+  // Load account data on user login
+  const handleUserLogin = (user: UserAccountProfile, snapshot: AccountDataSnapshot) => {
+    setCurrentUser(user);
+    localStorage.setItem("storyzone_current_user", JSON.stringify(user));
+    if (snapshot) {
+      if (snapshot.activeGameState) {
+        setGameState(snapshot.activeGameState);
+        localStorage.setItem("storyzone_active_game_state", JSON.stringify(snapshot.activeGameState));
+      }
+      if (Array.isArray(snapshot.saves) && snapshot.saves.length > 0) {
+        setSaves(snapshot.saves);
+        localStorage.setItem("storyzone_save_slots", JSON.stringify(snapshot.saves));
+      }
+      if (Array.isArray(snapshot.customStories) && snapshot.customStories.length > 0) {
+        setStories((prev) => {
+          const ids = new Set(snapshot.customStories.map((c) => c.id));
+          const base = prev.filter((p) => !ids.has(p.id));
+          return [...base, ...snapshot.customStories];
+        });
+      }
+      if (snapshot.settings) {
+        if (snapshot.settings.readerTheme) setReaderTheme(snapshot.settings.readerTheme);
+        if (snapshot.settings.fontSize) setFontSize(snapshot.settings.fontSize);
+        if (snapshot.settings.soundEnabled !== undefined) setSoundEnabled(snapshot.settings.soundEnabled);
+        if (snapshot.settings.aiPromptDirective) setAiPromptDirective(snapshot.settings.aiPromptDirective);
+        if (snapshot.settings.aiSystemPrompt) setAiSystemPrompt(snapshot.settings.aiSystemPrompt);
+      }
+    }
+    setNotification(`✨ Аккаунт подключен: ${user.username}! Прогресс синхронизирован со всеми устройствами.`);
+    setTimeout(() => setNotification(null), 4000);
+  };
+
+  // User logout
+  const handleUserLogout = () => {
+    setCurrentUser(null);
+    localStorage.removeItem("storyzone_current_user");
+    setNotification("Вы вышли из учётной записи. Локальная сессия сохранена.");
+    setTimeout(() => setNotification(null), 3000);
+  };
+
   // Start new story or switch to existing
   const handleSelectStory = (
     story: Story,
@@ -234,6 +405,7 @@ export default function App() {
       summary: story.synopsis || "Герой начинает путь в неизведанном мире.",
       keyFacts: ["Спутники объединились для общей цели"],
       timestamp: Date.now(),
+      chosenAction: "Пролог: Начало пути",
     };
 
     const initialLorebook: LorebookEntry[] = [
@@ -285,9 +457,284 @@ export default function App() {
       universeSetting: initialUniverseSetting,
       isEnding: false,
       isLoading: false,
+      coAuthorAgreements: story.coAuthorAgreements || [],
+      authorDictateMode: story.authorDictateMode ?? false,
+      strictActionFidelity: story.strictActionFidelity ?? true,
+      proportionalActionScaling: story.proportionalActionScaling ?? true,
+      coAuthorMode: story.coAuthorMode ?? false,
+      pendingStep: null,
     });
 
     setActiveTab("game");
+  };
+
+  // Pure updater to commit a story step into permanent history
+  const applyStoryStepData = (
+    prev: ActiveGameState,
+    data: StoryStepResponse,
+    actionLabel: string
+  ): ActiveGameState => {
+    try {
+      const currentStats: PlayerStats = prev.playerStats || {
+        hp: 100,
+        maxHp: 100,
+        energy: 100,
+        maxEnergy: 100,
+        gold: 50,
+        karma: 0,
+      };
+
+      const nextHp = Math.max(
+        0,
+        Math.min(
+          currentStats.maxHp,
+          currentStats.hp + (data.statChanges?.hp || 0)
+        )
+      );
+      const nextEnergy = Math.max(
+        0,
+        Math.min(
+          currentStats.maxEnergy,
+          currentStats.energy + (data.statChanges?.energy || 0)
+        )
+      );
+      const nextGold = Math.max(0, currentStats.gold + (data.statChanges?.gold || 0));
+
+      // Safe update characters affinity and trait evolution
+      let updatedCharacters = (prev.characters || []).map((char) => {
+        let updated = { ...char };
+        const charName = (char.name || "").toLowerCase().trim();
+
+        // Affinity change
+        if (Array.isArray(data.affinityChanges)) {
+          const affChange = data.affinityChanges.find(
+            (c: any) =>
+              c &&
+              typeof c.name === "string" &&
+              charName &&
+              c.name.toLowerCase().trim() === charName
+          );
+          if (affChange && typeof affChange.delta === "number") {
+            const nextAff = Math.max(0, Math.min(100, (char.affinity ?? 50) + affChange.delta));
+            updated.affinity = nextAff;
+          }
+        }
+
+        // Trait evolution if not locked by user
+        if (!char.isLockedTraits && Array.isArray(data.characterEvolution)) {
+          const evo = data.characterEvolution.find(
+            (e: any) =>
+              e &&
+              typeof e.name === "string" &&
+              charName &&
+              e.name.toLowerCase().trim() === charName
+          );
+          if (evo) {
+            const currentTraits = Array.isArray(updated.traits) ? [...updated.traits] : [];
+            if (evo.addedTrait && typeof evo.addedTrait === "string" && !currentTraits.includes(evo.addedTrait)) {
+              currentTraits.push(evo.addedTrait);
+            }
+            const currentHabits = Array.isArray(updated.habits) ? [...updated.habits] : [];
+            if (evo.addedHabit && typeof evo.addedHabit === "string" && !currentHabits.includes(evo.addedHabit)) {
+              currentHabits.push(evo.addedHabit);
+            }
+            updated.traits = currentTraits;
+            updated.habits = currentHabits;
+          }
+        }
+
+        return updated;
+      });
+
+      // Dynamic addition of new characters by user action/world event
+      if (data.characterUpdates?.add && Array.isArray(data.characterUpdates.add)) {
+        data.characterUpdates.add.forEach((newChar: any) => {
+          if (
+            newChar &&
+            typeof newChar.name === "string" &&
+            newChar.name.trim() &&
+            !updatedCharacters.some((c) => (c.name || "").toLowerCase().trim() === newChar.name.toLowerCase().trim())
+          ) {
+            updatedCharacters.push({
+              id: `char_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+              name: newChar.name.trim(),
+              role: newChar.role || "Новое действующее лицо",
+              affinity: typeof newChar.affinity === "number" ? newChar.affinity : 50,
+              affinityTitle: newChar.affinityTitle || "Новое знакомство",
+              bio: newChar.bio || "Появился по воле автора и разворачивающихся событий",
+              avatar: newChar.avatar || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400",
+              temperament: newChar.temperament || "сангвиник",
+              traits: Array.isArray(newChar.traits) ? newChar.traits : ["Непредсказуемый"],
+              habits: Array.isArray(newChar.habits) ? newChar.habits : ["Изучает обстановку"],
+              origin: newChar.origin,
+              abilities: newChar.abilities,
+              merits: newChar.merits,
+              currentStatus: newChar.currentStatus,
+            });
+          }
+        });
+      }
+
+      // Dynamic removal of characters
+      if (data.characterUpdates?.remove && Array.isArray(data.characterUpdates.remove)) {
+        const toRemove = data.characterUpdates.remove
+          .map((r: any) => (typeof r === "string" ? r : r?.name || "").toLowerCase().trim())
+          .filter(Boolean);
+        if (toRemove.length > 0) {
+          updatedCharacters = updatedCharacters.filter(
+            (c) => !toRemove.includes((c.name || "").toLowerCase().trim())
+          );
+        }
+      }
+
+      // Dynamic merits evolution from deeds in this scene
+      if (data.characterUpdates?.meritChanges && Array.isArray(data.characterUpdates.meritChanges)) {
+        data.characterUpdates.meritChanges.forEach((mc: any) => {
+          if (!mc || !mc.name || typeof mc.name !== "string") return;
+          const targetName = mc.name.toLowerCase().trim();
+          const char = updatedCharacters.find(
+            (c) => (c.name || "").toLowerCase().trim() === targetName
+          );
+          if (char && mc.newMerit && typeof mc.newMerit === "string") {
+            if (!Array.isArray(char.merits)) char.merits = [];
+            if (!char.merits.includes(mc.newMerit)) {
+              char.merits.push(mc.newMerit);
+            }
+          }
+        });
+      }
+
+      // Dynamic status/role evolution from deeds in this scene
+      if (data.characterUpdates?.statusChanges && Array.isArray(data.characterUpdates.statusChanges)) {
+        data.characterUpdates.statusChanges.forEach((sc: any) => {
+          if (!sc || !sc.name || typeof sc.name !== "string") return;
+          const targetName = sc.name.toLowerCase().trim();
+          const char = updatedCharacters.find(
+            (c) => (c.name || "").toLowerCase().trim() === targetName
+          );
+          if (char && sc.newStatus && typeof sc.newStatus === "string") {
+            char.currentStatus = sc.newStatus;
+          }
+        });
+      }
+
+      // Update inventory
+      const updatedInventory = Array.isArray(prev.inventory) ? [...prev.inventory] : [];
+      if (data.newItems && Array.isArray(data.newItems)) {
+        data.newItems.forEach((item: any) => {
+          if (typeof item === "string" && item.trim() && !updatedInventory.includes(item.trim())) {
+            updatedInventory.push(item.trim());
+            sound.playAction("item");
+          }
+        });
+      }
+
+      const newStepNumber = prev.stepCount + 1;
+      const validChoices: StoryChoice[] =
+        Array.isArray(data.choices) && data.choices.length > 0
+          ? data.choices
+          : Array.isArray(prev.currentChoices) && prev.currentChoices.length > 0
+          ? prev.currentChoices
+          : [];
+
+      const newHistoryItem: SceneHistoryItem = {
+        id: `step_${newStepNumber}`,
+        stepNumber: newStepNumber,
+        action: actionLabel,
+        sceneText: data.sceneText || prev.currentScene,
+        dialogueSpeaker: data.dialogueSpeaker,
+        timestamp: Date.now(),
+        statChanges: data.statChanges,
+        affinityChanges: data.affinityChanges,
+        newItems: data.newItems,
+        atmosphere: data.atmosphere,
+        choicesGiven: validChoices,
+        groundingSources: data.groundingSources,
+      };
+
+      // Update Memory Chapters with explicit action tracking
+      const updatedMemoryChapters = Array.isArray(prev.memoryChapters) ? [...prev.memoryChapters] : [];
+      const chapterSummaryText =
+        (typeof data.chapterSummary === "string" && data.chapterSummary.trim())
+          ? data.chapterSummary.trim()
+          : (data.sceneText
+              ? (data.sceneText.slice(0, 220).trim() + "...")
+              : `Ход по решению: «${actionLabel}»`);
+
+      updatedMemoryChapters.push({
+        id: `mem_${newStepNumber}`,
+        chapterNumber: updatedMemoryChapters.length + 1,
+        title: `Глава #${updatedMemoryChapters.length + 1}`,
+        summary: chapterSummaryText,
+        keyFacts: [actionLabel],
+        timestamp: Date.now(),
+        chosenAction: actionLabel,
+      });
+
+      // Update Lorebook
+      const updatedLorebook = Array.isArray(prev.lorebook) ? [...prev.lorebook] : [];
+      if (data.newLore && typeof data.newLore === "object" && typeof data.newLore.title === "string" && data.newLore.title.trim()) {
+        const loreTitle = data.newLore.title.trim();
+        const exists = updatedLorebook.some(
+          (l) => l && l.title && l.title.toLowerCase().trim() === loreTitle.toLowerCase()
+        );
+        if (!exists) {
+          updatedLorebook.push({
+            id: `lore_${Date.now()}`,
+            title: loreTitle,
+            description: data.newLore.description || "",
+            category: data.newLore.category || "правило_мира",
+            discoveredAtStep: newStepNumber,
+          });
+        }
+      }
+
+      // Apply world changes from user action
+      if (data.worldChange && typeof data.worldChange === "string") {
+        updatedLorebook.push({
+          id: `lore_world_${Date.now()}`,
+          title: "Изменение мира",
+          description: data.worldChange,
+          category: "правило_мира",
+          discoveredAtStep: newStepNumber,
+        });
+      }
+
+      return {
+        ...prev,
+        currentScene: data.sceneText || prev.currentScene,
+        dialogueSpeaker: data.dialogueSpeaker || undefined,
+        playerStats: {
+          ...currentStats,
+          hp: nextHp,
+          energy: nextEnergy,
+          gold: nextGold,
+        },
+        characters: updatedCharacters,
+        inventory: updatedInventory,
+        history: [...(prev.history || []), newHistoryItem],
+        currentChoices: validChoices,
+        stepCount: newStepNumber,
+        atmosphere: data.atmosphere || prev.atmosphere,
+        memoryChapters: updatedMemoryChapters,
+        lorebook: updatedLorebook,
+        suggestedMusic: (data.suggestedMusic as TrackType) || prev.suggestedMusic,
+        isEnding: !!data.isEnding,
+        endingTitle: data.endingTitle || null,
+        lastGroundingSources: data.groundingSources,
+        isLoading: false,
+        pendingStep: null,
+      };
+    } catch (innerErr) {
+      console.error("State updater error in applyStoryStepData:", innerErr);
+      return {
+        ...prev,
+        currentScene: data.sceneText || prev.currentScene,
+        currentChoices: Array.isArray(data.choices) && data.choices.length > 0 ? data.choices : prev.currentChoices,
+        isLoading: false,
+        pendingStep: null,
+      };
+    }
   };
 
   // Execute a choice or custom action
@@ -330,6 +777,10 @@ export default function App() {
             customKey: customApiKey,
             aiPromptDirective: aiPromptDirective,
             aiSystemPrompt: aiSystemPrompt,
+            coAuthorAgreements: gameState.coAuthorAgreements || [],
+            authorDictateMode: gameState.authorDictateMode ?? false,
+            strictActionFidelity: gameState.strictActionFidelity ?? true,
+            proportionalActionScaling: gameState.proportionalActionScaling ?? true,
           }),
         },
         fallback
@@ -337,215 +788,29 @@ export default function App() {
 
       const data = res.data && res.data.sceneText ? res.data : fallback;
 
+      // Co-Author Mode: Wait for author confirmation before committing into official story history
+      if (gameState.coAuthorMode) {
+        setGameState((prev) => {
+          if (!prev) return null;
+          return {
+            ...prev,
+            pendingStep: {
+              actionLabel,
+              response: data,
+              timestamp: Date.now(),
+            },
+            isLoading: false,
+          };
+        });
+        sound.playAction("magic");
+        setNotification("✨ Ответ соавтора готов! Проверьте и нажмите «Принять сюжет» для утверждения.");
+        setTimeout(() => setNotification(null), 4500);
+        return;
+      }
+
       setGameState((prev) => {
         if (!prev) return null;
-
-        // Calculate stat changes
-        const nextHp = Math.max(
-          0,
-          Math.min(
-            prev.playerStats.maxHp,
-            prev.playerStats.hp + (data.statChanges?.hp || 0)
-          )
-        );
-        const nextEnergy = Math.max(
-          0,
-          Math.min(
-            prev.playerStats.maxEnergy,
-            prev.playerStats.energy + (data.statChanges?.energy || 0)
-          )
-        );
-        const nextGold = Math.max(0, prev.playerStats.gold + (data.statChanges?.gold || 0));
-
-        // Update characters affinity and trait evolution
-        let updatedCharacters = prev.characters.map((char) => {
-          let updated = { ...char };
-
-          // Affinity change
-          const affChange = (data.affinityChanges || []).find(
-            (c: any) => c.name.toLowerCase() === char.name.toLowerCase()
-          );
-          if (affChange) {
-            const nextAff = Math.max(0, Math.min(100, char.affinity + (affChange.delta || 0)));
-            updated.affinity = nextAff;
-          }
-
-          // Trait evolution if not locked by user
-          if (!char.isLockedTraits && data.characterEvolution && Array.isArray(data.characterEvolution)) {
-            const evo = data.characterEvolution.find(
-              (e: any) => e.name.toLowerCase() === char.name.toLowerCase()
-            );
-            if (evo) {
-              const currentTraits = updated.traits ? [...updated.traits] : [];
-              if (evo.addedTrait && !currentTraits.includes(evo.addedTrait)) {
-                currentTraits.push(evo.addedTrait);
-              }
-              const currentHabits = updated.habits ? [...updated.habits] : [];
-              if (evo.addedHabit && !currentHabits.includes(evo.addedHabit)) {
-                currentHabits.push(evo.addedHabit);
-              }
-              updated.traits = currentTraits;
-              updated.habits = currentHabits;
-            }
-          }
-
-          return updated;
-        });
-
-        // Dynamic addition of new characters by user action/world event
-        if (data.characterUpdates?.add && Array.isArray(data.characterUpdates.add)) {
-          data.characterUpdates.add.forEach((newChar: any) => {
-            if (
-              newChar.name &&
-              !updatedCharacters.some((c) => c.name.toLowerCase() === newChar.name.toLowerCase())
-            ) {
-              updatedCharacters.push({
-                id: `char_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
-                name: newChar.name,
-                role: newChar.role || "Новое действующее лицо",
-                affinity: newChar.affinity ?? 50,
-                affinityTitle: newChar.affinityTitle || "Новое знакомство",
-                bio: newChar.bio || "Появился по воле автора и разворачивающихся событий",
-                avatar: newChar.avatar || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400",
-                temperament: newChar.temperament || "сангвиник",
-                traits: newChar.traits || ["Непредсказуемый"],
-                habits: newChar.habits || ["Изучает обстановку"],
-                origin: newChar.origin,
-                abilities: newChar.abilities,
-                merits: newChar.merits,
-                currentStatus: newChar.currentStatus,
-              });
-            }
-          });
-        }
-
-        // Dynamic removal of characters (if killed, left, or dismissed by user)
-        if (data.characterUpdates?.remove && Array.isArray(data.characterUpdates.remove)) {
-          const toRemove = data.characterUpdates.remove.map((r: string) => r.toLowerCase().trim());
-          updatedCharacters = updatedCharacters.filter(
-            (c) => !toRemove.includes(c.name.toLowerCase().trim())
-          );
-        }
-
-        // Dynamic merits evolution from deeds in this scene
-        if (data.characterUpdates?.meritChanges && Array.isArray(data.characterUpdates.meritChanges)) {
-          data.characterUpdates.meritChanges.forEach((mc: any) => {
-            const char = updatedCharacters.find(
-              (c) => c.name.toLowerCase() === (mc.name || "").toLowerCase()
-            );
-            if (char && mc.newMerit) {
-              if (!char.merits) char.merits = [];
-              if (!char.merits.includes(mc.newMerit)) {
-                char.merits.push(mc.newMerit);
-              }
-            }
-          });
-        }
-
-        // Dynamic status/role evolution from deeds in this scene
-        if (data.characterUpdates?.statusChanges && Array.isArray(data.characterUpdates.statusChanges)) {
-          data.characterUpdates.statusChanges.forEach((sc: any) => {
-            const char = updatedCharacters.find(
-              (c) => c.name.toLowerCase() === (sc.name || "").toLowerCase()
-            );
-            if (char && sc.newStatus) {
-              char.currentStatus = sc.newStatus;
-            }
-          });
-        }
-
-        // Update inventory
-        const updatedInventory = [...prev.inventory];
-        if (data.newItems && Array.isArray(data.newItems)) {
-          data.newItems.forEach((item: string) => {
-            if (!updatedInventory.includes(item)) {
-              updatedInventory.push(item);
-              sound.playAction("item");
-            }
-          });
-        }
-
-        const newStepNumber = prev.stepCount + 1;
-        const newHistoryItem: SceneHistoryItem = {
-          id: `step_${newStepNumber}`,
-          stepNumber: newStepNumber,
-          action: actionLabel,
-          sceneText: data.sceneText || prev.currentScene,
-          dialogueSpeaker: data.dialogueSpeaker,
-          timestamp: Date.now(),
-          statChanges: data.statChanges,
-          affinityChanges: data.affinityChanges,
-          newItems: data.newItems,
-          atmosphere: data.atmosphere,
-          choicesGiven: data.choices || [],
-          groundingSources: data.groundingSources,
-        };
-
-        // Update Memory Chapters
-        const updatedMemoryChapters = [...prev.memoryChapters];
-        if (data.chapterSummary) {
-          updatedMemoryChapters.push({
-            id: `mem_${newStepNumber}`,
-            chapterNumber: updatedMemoryChapters.length + 1,
-            title: `Событие #${newStepNumber}`,
-            summary: data.chapterSummary,
-            keyFacts: [actionLabel],
-            timestamp: Date.now(),
-          });
-        }
-
-        // Update Lorebook
-        const updatedLorebook = [...prev.lorebook];
-        if (data.newLore && data.newLore.title) {
-          const exists = updatedLorebook.some(
-            (l) => l.title.toLowerCase() === data.newLore.title.toLowerCase()
-          );
-          if (!exists) {
-            updatedLorebook.push({
-              id: `lore_${Date.now()}`,
-              title: data.newLore.title,
-              description: data.newLore.description || "",
-              category: data.newLore.category || "правило_мира",
-              discoveredAtStep: newStepNumber,
-            });
-          }
-        }
-
-        // Apply world changes from user action
-        if (data.worldChange) {
-          updatedLorebook.push({
-            id: `lore_world_${Date.now()}`,
-            title: "Изменение мира",
-            description: data.worldChange,
-            category: "правило_мира",
-            discoveredAtStep: newStepNumber,
-          });
-        }
-
-        return {
-          ...prev,
-          currentScene: data.sceneText || prev.currentScene,
-          dialogueSpeaker: data.dialogueSpeaker || undefined,
-          playerStats: {
-            ...prev.playerStats,
-            hp: nextHp,
-            energy: nextEnergy,
-            gold: nextGold,
-          },
-          characters: updatedCharacters,
-          inventory: updatedInventory,
-          history: [...prev.history, newHistoryItem],
-          currentChoices: data.choices || prev.currentChoices,
-          stepCount: newStepNumber,
-          atmosphere: data.atmosphere || prev.atmosphere,
-          memoryChapters: updatedMemoryChapters,
-          lorebook: updatedLorebook,
-          suggestedMusic: (data.suggestedMusic as TrackType) || prev.suggestedMusic,
-          isEnding: !!data.isEnding,
-          endingTitle: data.endingTitle || null,
-          lastGroundingSources: data.groundingSources,
-          isLoading: false,
-        };
+        return applyStoryStepData(prev, data, actionLabel);
       });
 
       // Auto-save on each turn
@@ -553,7 +818,32 @@ export default function App() {
     } catch (e) {
       console.error("Story step error:", e);
       setGameState((prev) => (prev ? { ...prev, isLoading: false } : null));
+      setNotification("⚠️ Связь с ИИ восстановлена. Вы можете продолжить.");
+      setTimeout(() => setNotification(null), 3500);
     }
+  };
+
+  // Officially approve and commit pending step in Co-Author Mode
+  const handleAcceptPendingStep = () => {
+    if (!gameState || !gameState.pendingStep) return;
+    const { actionLabel, response } = gameState.pendingStep;
+    sound.playAction("magic");
+    setGameState((prev) => {
+      if (!prev || !prev.pendingStep) return prev;
+      return applyStoryStepData(prev, response, actionLabel);
+    });
+    setNotification("✅ Сюжет соавтора утверждён и официально внесён в историю!");
+    setTimeout(() => setNotification(null), 3500);
+    handleSaveToSlot("slot_auto", false);
+  };
+
+  // Reject and discard pending step in Co-Author Mode
+  const handleRejectPendingStep = () => {
+    if (!gameState || !gameState.pendingStep) return;
+    sound.playClick();
+    setGameState((prev) => (prev ? { ...prev, pendingStep: null } : null));
+    setNotification("❌ Вариант соавтора отклонён. Вы можете ввести другое действие.");
+    setTimeout(() => setNotification(null), 3500);
   };
 
   // Execute tactical combat combo chain
@@ -582,6 +872,7 @@ export default function App() {
             musicBpm: musicBpm,
             customKey: customApiKey,
             aiSystemPrompt: aiSystemPrompt,
+            coAuthorAgreements: gameState.coAuthorAgreements || [],
           }),
         },
         fallback
@@ -625,16 +916,15 @@ export default function App() {
         };
 
         const updatedMemoryChapters = [...prev.memoryChapters];
-        if (data.chapterSummary) {
-          updatedMemoryChapters.push({
-            id: `mem_${newStepNumber}`,
-            chapterNumber: updatedMemoryChapters.length + 1,
-            title: `Тактический триумф #${newStepNumber}`,
-            summary: data.chapterSummary,
-            keyFacts: [`Стойка: ${combo.stanceName}`, `Ранг стиля: ${combo.styleRank}`],
-            timestamp: Date.now(),
-          });
-        }
+        updatedMemoryChapters.push({
+          id: `mem_${newStepNumber}`,
+          chapterNumber: updatedMemoryChapters.length + 1,
+          title: `Тактический триумф #${newStepNumber}`,
+          summary: data.chapterSummary || `Успешное применение боевой комбинации «${combo.stanceName}»`,
+          keyFacts: [`Стойка: ${combo.stanceName}`, `Ранг стиля: ${combo.styleRank}`],
+          timestamp: Date.now(),
+          chosenAction: newHistoryItem.action,
+        });
 
         return {
           ...prev,
@@ -659,6 +949,8 @@ export default function App() {
     } catch (e) {
       console.error("Failed to execute tactical combo:", e);
       setGameState((prev) => (prev ? { ...prev, isLoading: false } : null));
+      setNotification("⚠️ Ошибка выполнения тактического действия. Управление возвращено.");
+      setTimeout(() => setNotification(null), 3000);
     }
   };
 
@@ -686,6 +978,7 @@ export default function App() {
             memoryChapters: gameState.memoryChapters,
             customKey: customApiKey,
             aiSystemPrompt: aiSystemPrompt,
+            coAuthorAgreements: gameState.coAuthorAgreements || [],
           }),
         },
         fallback
@@ -737,6 +1030,7 @@ export default function App() {
           summary: data.divergenceSummary || payload.description,
           keyFacts: [`Эффект бабочки: ${payload.type}`, payload.title],
           timestamp: Date.now(),
+          chosenAction: `Развилка: ${payload.title} (${payload.description})`,
         });
 
         return {
@@ -757,6 +1051,8 @@ export default function App() {
     } catch (e) {
       console.error("Failed to inject divergence:", e);
       setGameState((prev) => (prev ? { ...prev, isLoading: false } : null));
+      setNotification("⚠️ Ошибка развилки сюжета. Управление возвращено.");
+      setTimeout(() => setNotification(null), 3000);
     }
   };
 
@@ -1019,6 +1315,7 @@ export default function App() {
           summary: summaryToUse,
           keyFacts: ["Текст адаптирован автором"],
           timestamp: Date.now(),
+          chosenAction: "Авторская редакция текста главы",
         });
       }
 
@@ -1052,6 +1349,45 @@ export default function App() {
         lorebook: updatedLore,
       };
     });
+
+    // If nextLogicalStep was already generated by ChapterEditModal, apply it immediately:
+    if (shouldAutoAdvance && options?.nextLogicalStep?.sceneText) {
+      const nextStepData = options.nextLogicalStep;
+      const targetStep = targetStepNumber ?? (gameState?.stepCount || 1);
+      const newStepNumber = targetStep + 1;
+      const nextHistoryItem: SceneHistoryItem = {
+        id: `step_${newStepNumber}`,
+        stepNumber: newStepNumber,
+        action: nextStepData.actionLabel || "Сюжетное продолжение авторских правок",
+        sceneText: nextStepData.sceneText,
+        choicesGiven: nextStepData.choices || [],
+        timestamp: Date.now(),
+      };
+      setGameState((prev) => {
+        if (!prev) return null;
+        let updatedMemories = [...prev.memoryChapters];
+        updatedMemories.push({
+          id: `mem_${newStepNumber}`,
+          chapterNumber: newStepNumber,
+          title: `Глава #${newStepNumber}`,
+          summary: nextStepData.sceneText.slice(0, 180).trim() + "...",
+          keyFacts: ["Сюжет адаптирован под авторские правки"],
+          timestamp: Date.now(),
+          chosenAction: nextStepData.actionLabel || "Сюжетное продолжение авторских правок",
+        });
+        return {
+          ...prev,
+          stepCount: newStepNumber,
+          currentScene: nextStepData.sceneText,
+          currentChoices: nextStepData.choices || prev.currentChoices,
+          history: [...prev.history, nextHistoryItem],
+          memoryChapters: updatedMemories,
+          isLoading: false,
+        };
+      });
+      sound.playChoice();
+      return;
+    }
 
     // Check if we need to call AI for through-update / choices recalculation:
     const needsAiCall =
@@ -1166,6 +1502,7 @@ export default function App() {
                   data.nextLogicalStep.sceneText.slice(0, 180).trim() + "...",
                 keyFacts: ["Сюжет адаптирован под авторские правки"],
                 timestamp: Date.now(),
+                chosenAction: data.nextLogicalStep.actionLabel || "Сюжетное продолжение авторских правок",
               });
 
               return {
@@ -1270,6 +1607,30 @@ export default function App() {
     setGameState((prev) => {
       if (!prev) return null;
       return { ...prev, characters: [...prev.characters, newChar] };
+    });
+  };
+
+  const handleAddAttachment = (attachment: MediaAttachment) => {
+    setGameState((prev) => {
+      if (!prev) return null;
+      const current = prev.attachedMedia || [];
+      const updated = [attachment, ...current.filter((a) => a.id !== attachment.id)];
+      return {
+        ...prev,
+        attachedMedia: updated,
+      };
+    });
+    setNotification(`Файл «${attachment.name}» успешно прикреплен к повести!`);
+    setTimeout(() => setNotification(null), 3500);
+  };
+
+  const handleRemoveAttachment = (id: string) => {
+    setGameState((prev) => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        attachedMedia: (prev.attachedMedia || []).filter((a) => a.id !== id),
+      };
     });
   };
 
@@ -1392,6 +1753,19 @@ export default function App() {
   const handleSaveToSlot = (slotId: string, playSound = true) => {
     if (!gameState) return;
 
+    let chatHistory = gameState.chatHistory;
+    if (!chatHistory || chatHistory.length === 0) {
+      try {
+        const saved = localStorage.getItem(`storyzone_chat_${gameState.story.id}`);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            chatHistory = parsed;
+          }
+        }
+      } catch (e) {}
+    }
+
     const newSave: SaveSlot = {
       id: slotId,
       storyId: gameState.story.id,
@@ -1406,6 +1780,16 @@ export default function App() {
       characters: [...gameState.characters],
       history: [...gameState.history],
       choices: [...gameState.currentChoices],
+      memoryChapters: [...(gameState.memoryChapters || [])],
+      lorebook: [...(gameState.lorebook || [])],
+      branches: [...(gameState.branches || [])],
+      activeBranchId: gameState.activeBranchId || "main",
+      narrativeStyle: gameState.narrativeStyle,
+      narrativePOV: gameState.narrativePOV,
+      universeSetting: gameState.universeSetting,
+      chatHistory: chatHistory,
+      aiPromptDirective: aiPromptDirective,
+      divergenceLog: gameState.divergenceLog,
     };
 
     setSaves((prev) => {
@@ -1439,9 +1823,23 @@ export default function App() {
       initialChoices: save.choices,
     };
 
+    // Restore co-author chat into localStorage if present in save
+    if (save.chatHistory && Array.isArray(save.chatHistory) && save.chatHistory.length > 0) {
+      try {
+        localStorage.setItem(`storyzone_chat_${save.storyId}`, JSON.stringify(save.chatHistory));
+      } catch (e) {}
+    }
+
+    if (save.aiPromptDirective) {
+      setAiPromptDirective(save.aiPromptDirective);
+      try {
+        localStorage.setItem("storyzone_prompt_directive", save.aiPromptDirective);
+      } catch (e) {}
+    }
+
     setGameState({
       story,
-      currentScene: save.sceneText,
+      currentScene: save.history?.[save.history.length - 1]?.sceneText || save.sceneText,
       playerStats: { ...save.playerStats },
       inventory: [...save.inventory],
       characters: save.characters.map((c) => ({ ...c })),
@@ -1449,23 +1847,30 @@ export default function App() {
       currentChoices: [...save.choices],
       stepCount: save.currentStep,
       atmosphere: "mysterious",
-      memoryChapters: [
-        {
-          id: "m_saved",
-          chapterNumber: 1,
-          title: "Сохранённый прогресс",
-          summary: save.sceneText.slice(0, 100),
-          timestamp: save.timestamp,
-        },
-      ],
-      lorebook: [],
-      branches: [],
-      activeBranchId: "main",
-      narrativeStyle: NarrativeStyle.LITERARY,
-      narrativePOV: NarrativePOV.SECOND,
+      memoryChapters:
+        save.memoryChapters && save.memoryChapters.length > 0
+          ? save.memoryChapters
+          : [
+              {
+                id: "m_saved",
+                chapterNumber: 1,
+                title: "Сохранённый прогресс",
+                summary: save.sceneText.slice(0, 100),
+                timestamp: save.timestamp,
+                chosenAction: "Загрузка сохранения",
+              },
+            ],
+      lorebook: save.lorebook || [],
+      branches: save.branches || [],
+      activeBranchId: save.activeBranchId || "main",
+      narrativeStyle: save.narrativeStyle || NarrativeStyle.LITERARY,
+      narrativePOV: save.narrativePOV || NarrativePOV.SECOND,
       currentFocus: SceneFocus.GENERAL,
       ultraMemory: true,
       suggestedMusic: "calm",
+      universeSetting: save.universeSetting,
+      chatHistory: save.chatHistory,
+      divergenceLog: save.divergenceLog,
       isEnding: false,
       isLoading: false,
     });
@@ -1545,6 +1950,12 @@ export default function App() {
         onOpenSettings={() => setIsSettingsOpen(true)}
         onOpenExportImport={() => setIsExportImportOpen(true)}
         onOpenInternetFinder={() => setIsInternetFinderOpen(true)}
+        onOpenCloudSync={() => setIsCloudSyncOpen(true)}
+        onOpenAccountModal={() => setIsAccountModalOpen(true)}
+        currentUser={currentUser}
+        onOpenWorldMap={() => setIsWorldMapModalOpen(true)}
+        onOpenMediaAttachment={() => setIsMediaAttachmentOpen(true)}
+        attachedMediaCount={gameState?.attachedMedia?.length || 0}
         isAiEnabled={isAiEnabled}
         soundEnabled={soundEnabled}
         setSoundEnabled={setSoundEnabled}
@@ -1571,6 +1982,7 @@ export default function App() {
             onRollbackStep={handleRollbackStep}
             onRewindPreviousChapter={handleRewindPreviousChapter}
             onDeleteCurrentChapter={handleDeleteCurrentChapter}
+            onForceUnlockLoading={handleForceUnlockLoading}
             onQuickSave={() => handleSaveToSlot("slot_1")}
             onExitToCatalog={() => setActiveTab("catalog")}
             onSaveEditedChapter={handleSaveEditedChapter}
@@ -1634,6 +2046,71 @@ export default function App() {
                 };
               });
             }}
+            onUpdateChatHistory={(messages) => {
+              setGameState((prev) => (prev ? { ...prev, chatHistory: messages } : null));
+            }}
+            onOpenCloudSync={() => setIsCloudSyncOpen(true)}
+            onOpenMediaAttachment={() => setIsMediaAttachmentOpen(true)}
+            onToggleAuthorDictateMode={(enabled) => {
+              setGameState((prev) => (prev ? { ...prev, authorDictateMode: enabled } : null));
+            }}
+            onToggleStrictActionFidelity={(enabled) => {
+              setGameState((prev) => (prev ? { ...prev, strictActionFidelity: enabled } : null));
+            }}
+            onToggleProportionalActionScaling={(enabled) => {
+              setGameState((prev) => (prev ? { ...prev, proportionalActionScaling: enabled } : null));
+            }}
+            onAddCoAuthorAgreement={(agreement) => {
+              setGameState((prev) => {
+                if (!prev) return null;
+                const existing = prev.coAuthorAgreements || [];
+                const updated = [...existing.filter((a) => a.id !== agreement.id), agreement];
+                return {
+                  ...prev,
+                  coAuthorAgreements: updated,
+                  story: {
+                    ...prev.story,
+                    coAuthorAgreements: updated,
+                  },
+                };
+              });
+            }}
+            onRemoveCoAuthorAgreement={(id) => {
+              setGameState((prev) => {
+                if (!prev) return null;
+                const existing = prev.coAuthorAgreements || [];
+                const updated = existing.filter((a) => a.id !== id);
+                return {
+                  ...prev,
+                  coAuthorAgreements: updated,
+                  story: {
+                    ...prev.story,
+                    coAuthorAgreements: updated,
+                  },
+                };
+              });
+            }}
+            onUpdateCoAuthorAgreement={(agreement) => {
+              setGameState((prev) => {
+                if (!prev) return null;
+                const existing = prev.coAuthorAgreements || [];
+                const updated = existing.map((a) => (a.id === agreement.id ? agreement : a));
+                return {
+                  ...prev,
+                  coAuthorAgreements: updated,
+                  story: {
+                    ...prev.story,
+                    coAuthorAgreements: updated,
+                  },
+                };
+              });
+            }}
+            onToggleCoAuthorMode={(enabled) => {
+              setGameState((prev) => (prev ? { ...prev, coAuthorMode: enabled } : null));
+            }}
+            onAcceptPendingStep={handleAcceptPendingStep}
+            onRejectPendingStep={handleRejectPendingStep}
+            onOpenWorldMap={() => setIsWorldMapModalOpen(true)}
           />
         )}
 
@@ -1652,6 +2129,7 @@ export default function App() {
             onUpdateCharacter={handleUpdateCharacter}
             onAddCharacter={handleAddCharacter}
             customApiKey={customApiKey}
+            onOpenMediaAttachment={() => setIsMediaAttachmentOpen(true)}
           />
         )}
 
@@ -1663,6 +2141,7 @@ export default function App() {
             onDeleteSave={handleDeleteSave}
             hasActiveGame={!!gameState}
             onImportSaves={handleImportSaves}
+            onOpenCloudSync={() => setIsCloudSyncOpen(true)}
           />
         )}
       </main>
@@ -1682,6 +2161,30 @@ export default function App() {
         gameState={gameState}
         onImportGameState={handleImportGameState}
         customApiKey={customApiKey}
+        aiPromptDirective={aiPromptDirective}
+      />
+
+      {/* Cloud & Mobile Cross-Device Account Sync Modal */}
+      <CloudSyncModal
+        isOpen={isCloudSyncOpen}
+        onClose={() => setIsCloudSyncOpen(false)}
+        gameState={gameState}
+        saves={saves}
+        onLoadSyncedGameState={(newState, newSaves, newChatHistory) => {
+          setGameState(newState);
+          if (newSaves && Array.isArray(newSaves)) {
+            setSaves(newSaves);
+            localStorage.setItem("storyzone_saves_v2", JSON.stringify(newSaves));
+          }
+          if (newChatHistory && Array.isArray(newChatHistory)) {
+            try {
+              localStorage.setItem(`storyzone_chat_${newState.story.id}`, JSON.stringify(newChatHistory));
+            } catch (e) {}
+          }
+          setActiveTab("game");
+          setNotification("История и весь прогресс успешно перенесены из облака на это устройство!");
+          setTimeout(() => setNotification(null), 4000);
+        }}
       />
 
       {/* Preferences & Settings Modal */}
@@ -1707,7 +2210,108 @@ export default function App() {
         setAiSystemPrompt={setAiSystemPrompt}
         gameState={gameState}
         onImportGameState={handleImportGameState}
+        onToggleCoAuthorMode={(enabled) => {
+          setGameState((prev) => (prev ? { ...prev, coAuthorMode: enabled } : null));
+        }}
+        onToggleStrictActionFidelity={(enabled) => {
+          setGameState((prev) => (prev ? { ...prev, strictActionFidelity: enabled } : null));
+        }}
+        onToggleProportionalActionScaling={(enabled) => {
+          setGameState((prev) => (prev ? { ...prev, proportionalActionScaling: enabled } : null));
+        }}
       />
+
+      {/* Media Attachment & File Lab Modal */}
+      {gameState && (
+        <MediaAttachmentModal
+          isOpen={isMediaAttachmentOpen}
+          onClose={() => setIsMediaAttachmentOpen(false)}
+          gameState={gameState}
+          customApiKey={customApiKey}
+          onAddAttachment={handleAddAttachment}
+          onRemoveAttachment={handleRemoveAttachment}
+          onInjectSceneText={(text) => {
+            setGameState((prev) => {
+              if (!prev) return null;
+              return {
+                ...prev,
+                currentScene: `${prev.currentScene}\n\n${text}`,
+              };
+            });
+            setNotification("Фрагмент из медиафайла успешно внедрён в главу!");
+            setTimeout(() => setNotification(null), 3500);
+          }}
+          onExecuteAction={(act) => executeStoryStep(act)}
+          onUpdateCharacter={handleUpdateCharacter}
+          onAddLorebookEntry={(entry) => {
+            setGameState((prev) => {
+              if (!prev) return null;
+              const exists = prev.lorebook.some(
+                (l) => l.title.toLowerCase() === entry.title.toLowerCase()
+              );
+              if (exists) return prev;
+              return {
+                ...prev,
+                lorebook: [...prev.lorebook, entry],
+              };
+            });
+            setNotification(`Запись «${entry.title}» занесена в лорбук!`);
+            setTimeout(() => setNotification(null), 3500);
+          }}
+        />
+      )}
+
+      {/* Universal User Account & Cross-Device Cloud Sync Modal */}
+      <AccountModal
+        isOpen={isAccountModalOpen}
+        onClose={() => setIsAccountModalOpen(false)}
+        currentUser={currentUser}
+        onUserLogin={handleUserLogin}
+        onUserLogout={handleUserLogout}
+        onForceSync={handleForceSync}
+        currentGameState={gameState}
+        currentSaves={saves}
+        customStories={stories.filter((s) => s.isCustom)}
+        autoSyncEnabled={autoSyncEnabled}
+        onToggleAutoSync={(enabled) => {
+          setAutoSyncEnabled(enabled);
+          localStorage.setItem("storyzone_auto_sync_enabled", String(enabled));
+        }}
+        isSyncing={isSyncing}
+        lastSyncedAt={lastSyncedAt}
+      />
+
+      {/* Interactive D3 World Map Modal */}
+      {gameState && (
+        <WorldMapModal
+          isOpen={isWorldMapModalOpen}
+          onClose={() => setIsWorldMapModalOpen(false)}
+          gameState={gameState}
+          onExecuteAction={(act) => executeStoryStep(act)}
+          onAddLorebookEntry={(entry) => {
+            setGameState((prev) => {
+              if (!prev) return null;
+              const exists = prev.lorebook.some(
+                (l) => l.title.toLowerCase() === entry.title.toLowerCase()
+              );
+              if (exists) return prev;
+              return {
+                ...prev,
+                lorebook: [...prev.lorebook, entry],
+              };
+            });
+            setNotification(`Локация «${entry.title}» добавлена в мир и лорбук!`);
+            setTimeout(() => setNotification(null), 3500);
+          }}
+        />
+      )}
+
+      {/* Notification Toast */}
+      {notification && (
+        <div className="fixed bottom-6 right-6 z-50 max-w-md px-4 py-3 rounded-xl bg-neutral-900/95 border border-purple-500/50 text-neutral-100 shadow-2xl backdrop-blur-md flex items-center gap-3 animate-fade-in">
+          <span className="text-sm">{notification}</span>
+        </div>
+      )}
     </div>
   );
 }

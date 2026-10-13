@@ -15,6 +15,14 @@ import {
   Package,
   Users2,
   BookMarked,
+  Bot,
+  MessageSquare,
+  Compass,
+  CheckCircle2,
+  Clock,
+  Layers,
+  Sliders,
+  AlertCircle,
 } from "lucide-react";
 import {
   ActiveGameState,
@@ -23,6 +31,7 @@ import {
   SceneFocus,
   Story,
   StoryGenre,
+  StoryChatMessage,
 } from "../types";
 import { sound } from "../utils/audio";
 import { safeFetchJson } from "../utils/safeApi";
@@ -33,6 +42,7 @@ interface StoryExportImportModalProps {
   gameState: ActiveGameState | null;
   onImportGameState: (newState: ActiveGameState) => void;
   customApiKey?: string;
+  aiPromptDirective?: string;
 }
 
 export const StoryExportImportModal: React.FC<StoryExportImportModalProps> = ({
@@ -41,10 +51,15 @@ export const StoryExportImportModal: React.FC<StoryExportImportModalProps> = ({
   gameState,
   onImportGameState,
   customApiKey,
+  aiPromptDirective,
 }) => {
   const [activeTab, setActiveTab] = useState<"export" | "import">("export");
-  const [exportFormat, setExportFormat] = useState<"json" | "markdown" | "chapter">("json");
+  const [exportFormat, setExportFormat] = useState<"json" | "markdown" | "coauthor" | "chapter">("json");
   const [copied, setCopied] = useState(false);
+  const [includeChat, setIncludeChat] = useState(true);
+  const [includeAcceptedEdits, setIncludeAcceptedEdits] = useState(true);
+  const [includeLore, setIncludeLore] = useState(true);
+  const [importNotification, setImportNotification] = useState<string | null>(null);
 
   // Import states
   const [importMode, setImportMode] = useState<"ai-text" | "json-file">("ai-text");
@@ -55,13 +70,123 @@ export const StoryExportImportModal: React.FC<StoryExportImportModalProps> = ({
 
   if (!isOpen) return null;
 
-  // Build JSON export
+  // Helper: Format date & time
+  const formatDateTime = (ts?: number) => {
+    if (!ts) return "";
+    return new Date(ts).toLocaleString("ru-RU", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
+
+  // Helper: Retrieve all co-author chat messages merged and sorted chronologically
+  const getFullChatHistory = (): StoryChatMessage[] => {
+    if (!gameState) return [];
+    const list: StoryChatMessage[] = [];
+    const seen = new Set<string>();
+
+    const addMsg = (m: StoryChatMessage) => {
+      if (m && m.id && !seen.has(m.id)) {
+        seen.add(m.id);
+        list.push(m);
+      }
+    };
+
+    if (Array.isArray(gameState.chatHistory)) {
+      gameState.chatHistory.forEach(addMsg);
+    }
+
+    try {
+      const saved = localStorage.getItem(`storyzone_chat_${gameState.story.id}`);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          parsed.forEach(addMsg);
+        }
+      }
+    } catch (e) {}
+
+    list.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    return list;
+  };
+
+  // Helper: Translate proposal type to Russian
+  const formatProposalType = (type: string) => {
+    switch (type) {
+      case "change_style": return "Стиль повествования";
+      case "change_length": return "Настройка длины глав";
+      case "change_genre": return "Изменение жанра";
+      case "add_character": return "Добавление спутника";
+      case "update_character": return "Отношения & Статус спутника";
+      case "inject_scene": return "Сюжетная вставка в сцену";
+      case "execute_action": return "Реализация авторского хода";
+      case "update_directive": return "Директива ИИ-Соавтору";
+      case "update_universe": return "Сеттинг & Законы вселенной";
+      case "add_lore_fact": return "Новая тайна лорбука";
+      default: return "Сюжетная правка";
+    }
+  };
+
+  // Helper: Extract accepted co-author edits
+  const getAcceptedCoAuthorEdits = (messages: StoryChatMessage[]) => {
+    const edits: Array<{
+      id: string;
+      title: string;
+      type: string;
+      typeLabel: string;
+      description: string;
+      timestamp: number;
+      payload?: any;
+    }> = [];
+
+    messages.forEach((m) => {
+      if (m.actionProposal && m.actionProposal.applied) {
+        edits.push({
+          id: m.id,
+          title: m.actionProposal.title,
+          type: m.actionProposal.type,
+          typeLabel: formatProposalType(m.actionProposal.type),
+          description: m.actionProposal.description,
+          timestamp: m.timestamp,
+          payload: m.actionProposal.payload,
+        });
+      }
+    });
+
+    return edits;
+  };
+
+  const currentChatHistory = getFullChatHistory();
+  const currentAcceptedEdits = getAcceptedCoAuthorEdits(currentChatHistory);
+  const currentEditedChapters = (gameState?.history || []).filter((h) => h.wasEdited);
+
+  // 1. Build JSON export (Complete Full-Archive Dump)
   const generateJsonExport = () => {
     if (!gameState) return "{}";
+    const chatMessages = getFullChatHistory();
+    const acceptedCoAuthorEdits = getAcceptedCoAuthorEdits(chatMessages);
+    const editedChapters = (gameState.history || []).filter((h) => h.wasEdited);
+    const activeDirective =
+      aiPromptDirective ||
+      (typeof localStorage !== "undefined" ? localStorage.getItem("storyzone_prompt_directive") : null);
+
     const exportData = {
       app: "StoryZone",
-      version: "2.0",
+      version: "3.0",
       exportedAt: new Date().toISOString(),
+      metadata: {
+        storyTitle: gameState.story.title,
+        genre: gameState.story.genre,
+        author: gameState.story.author || "Автор",
+        stepCount: gameState.stepCount,
+        chaptersCount: gameState.memoryChapters?.length || 1,
+        totalChatMessages: chatMessages.length,
+        acceptedCoAuthorEditsCount: acceptedCoAuthorEdits.length,
+        editedChaptersCount: editedChapters.length,
+      },
       gameState: {
         story: gameState.story,
         currentScene: gameState.currentScene,
@@ -81,61 +206,229 @@ export const StoryExportImportModal: React.FC<StoryExportImportModalProps> = ({
         narrativePOV: gameState.narrativePOV,
         currentFocus: gameState.currentFocus,
         sceneArtUrl: gameState.sceneArtUrl,
+        universeSetting: gameState.universeSetting,
+        suggestedMusic: gameState.suggestedMusic,
+        ultraMemory: gameState.ultraMemory,
+        divergenceLog: gameState.divergenceLog,
+        chatHistory: chatMessages,
+        aiPromptDirective: activeDirective || undefined,
+      },
+      coAuthorCollaboration: {
+        totalDiscussions: chatMessages.length,
+        acceptedEditsCount: acceptedCoAuthorEdits.length,
+        acceptedEdits: acceptedCoAuthorEdits,
+        chatMessages: chatMessages,
+        promptDirective: activeDirective,
+        editedChapters: editedChapters.map((ch) => ({
+          stepNumber: ch.stepNumber,
+          action: ch.action,
+          sceneText: ch.sceneText,
+          wasEdited: true,
+          timestamp: ch.timestamp,
+        })),
       },
     };
     return JSON.stringify(exportData, null, 2);
   };
 
-  // Build Book Markdown export
+  // 2. Build Book Markdown export
   const generateMarkdownBook = () => {
     if (!gameState) return "";
+    const chatMessages = getFullChatHistory();
+    const acceptedCoAuthorEdits = getAcceptedCoAuthorEdits(chatMessages);
+    const universe = gameState.universeSetting || {
+      universeName: gameState.story.fandomSource || gameState.story.genre,
+    };
+
     let md = `# ${gameState.story.title}\n`;
-    md += `*Жанр: ${gameState.story.genre} | Автор: ${gameState.story.author || "Игрок"}*\n\n`;
+    md += `*Жанр: ${gameState.story.genre} | Автор: ${gameState.story.author || "Игрок"} | Вселенная: ${universe.universeName}*\n`;
+    md += `*Дата сохранения: ${formatDateTime(Date.now())} | Шагов в сюжете: ${gameState.stepCount} | Глав: ${gameState.memoryChapters?.length || 1}*\n\n`;
     md += `## Пролог и Синопсис\n${gameState.story.synopsis}\n\n`;
     md += `---\n\n`;
 
-    // Chronicle of steps
-    md += `## Хроника Событий\n\n`;
+    // Chronicle of steps and chapters
+    md += `## Хроника Событий и Глав\n\n`;
     (gameState.history || []).forEach((item, idx) => {
-      md += `### Эпизод ${idx + 1}: ${item.action || "Ход событий"}\n\n`;
+      const matchingMem = gameState.memoryChapters?.find((m) => m.chapterNumber === item.stepNumber);
+      const chapterTitle = matchingMem?.title || `Эпизод ${idx + 1}`;
+      const actionText = matchingMem?.chosenAction || item.action || "Ход событий";
+
+      md += `### ${chapterTitle}: ${actionText}\n`;
+      if (item.timestamp) {
+        md += `*Время: ${formatDateTime(item.timestamp)}*\n\n`;
+      }
+      md += `> **Выбранное действие / ход автора:** «${actionText}»\n\n`;
+
       if (item.dialogueSpeaker) {
         md += `> **Говорит ${item.dialogueSpeaker}:**\n\n`;
       }
       md += `${item.sceneText}\n\n`;
+
+      if (item.wasEdited) {
+        md += `*(✏️ Текст этой главы был отредактирован автором и адаптирован ИИ)*\n\n`;
+      }
+
       if (item.newItems && item.newItems.length > 0) {
         md += `*Получено: ${item.newItems.join(", ")}*\n\n`;
       }
     });
 
-    // Current climax
+    // Current scene climax
     md += `### Текущий момент (Кульминация)\n\n${gameState.currentScene}\n\n`;
 
-    // Companions & lore appendix
-    md += `---\n\n## Спутники & Отношения\n`;
-    gameState.characters.forEach((c) => {
-      md += `- **${c.name}** (${c.role}): Симпатия ${c.affinity || 50}%. Черты: ${(c.traits || []).join(", ")}. ${c.bio || ""}\n`;
-    });
+    // Accepted Co-Author Edits Registry
+    if (includeAcceptedEdits && acceptedCoAuthorEdits.length > 0) {
+      md += `---\n\n## Принятые правки и решения с ИИ-Соавтором\n\n`;
+      md += `Ниже зафиксированы все решения, развилки и сюжетные корректировки, предложенные ИИ-Соавтором и принятые автором:\n\n`;
+      acceptedCoAuthorEdits.forEach((edit, idx) => {
+        md += `### ${idx + 1}. [${edit.typeLabel}] ${edit.title}\n`;
+        md += `> **Время принятия:** ${formatDateTime(edit.timestamp)}\n`;
+        md += `> **Суть правки:** ${edit.description}\n`;
+        if (edit.payload) {
+          if (edit.payload.style) md += `> **Установленный стиль:** ${edit.payload.style}\n`;
+          if (edit.payload.length) md += `> **Длина глав:** ${edit.payload.length}\n`;
+          if (edit.payload.directive) md += `> **Директива автору/ИИ:** «${edit.payload.directive}»\n`;
+          if (edit.payload.character) md += `> **Персонаж:** ${edit.payload.character.name} (${edit.payload.character.role})\n`;
+          if (edit.payload.newSceneText) md += `> **Сюжетная вставка:** «${edit.payload.newSceneText}»\n`;
+          if (edit.payload.actionLabel) md += `> **Воплощённое действие:** «${edit.payload.actionLabel}»\n`;
+        }
+        md += `\n`;
+      });
+    }
 
-    if (gameState.lorebook && gameState.lorebook.length > 0) {
-      md += `\n## Лорбук & Мироустройство\n`;
-      gameState.lorebook.forEach((l) => {
-        md += `- **[${l.category}] ${l.title}**: ${l.description}\n`;
+    // Co-Author Full Discussion Transcript
+    if (includeChat && chatMessages.length > 0) {
+      md += `---\n\n## Стенограмма обсуждений с ИИ-Соавтором\n\n`;
+      md += `Полный протокол творческих консультаций, вопросов автора и предложений ИИ-Соавтора по сюжету:\n\n`;
+      chatMessages.forEach((msg, idx) => {
+        const roleName = msg.role === "user" ? "👤 Автор" : msg.role === "assistant" ? "🤖 ИИ-Соавтор" : "⚙️ Система";
+        md += `#### #${idx + 1} ${roleName} *(${formatDateTime(msg.timestamp)})*\n\n`;
+        md += `${msg.content}\n\n`;
+
+        if (msg.actionProposal) {
+          md += `> 📌 **Предложение:** ${msg.actionProposal.title}\n`;
+          md += `> *Статус:* ${msg.actionProposal.applied ? "✅ Принято автором и внедрено" : "⏳ На рассмотрении"}\n`;
+          md += `> *Описание:* ${msg.actionProposal.description}\n\n`;
+        }
+      });
+    }
+
+    // Companions & Lore Appendix
+    if (includeLore) {
+      md += `---\n\n## Спутники & Отношения\n`;
+      gameState.characters.forEach((c) => {
+        md += `- **${c.name}** (${c.role}): Отношение ${c.affinity || 50}%. Черты: ${(c.traits || []).join(", ")}. ${c.bio || ""}\n`;
+      });
+
+      if (gameState.lorebook && gameState.lorebook.length > 0) {
+        md += `\n## Лорбук & Мироустройство\n`;
+        gameState.lorebook.forEach((l) => {
+          md += `- **[${l.category}] ${l.title}**: ${l.description}\n`;
+        });
+      }
+    }
+
+    return md;
+  };
+
+  // 3. Dedicated Co-Author Collaboration Chronicle Export
+  const generateCoAuthorReport = () => {
+    if (!gameState) return "";
+    const messages = getFullChatHistory();
+    const acceptedEdits = getAcceptedCoAuthorEdits(messages);
+    const editedChapters = (gameState.history || []).filter((h) => h.wasEdited);
+    const universe = gameState.universeSetting || {
+      universeName: gameState.story.fandomSource || gameState.story.genre,
+    };
+    const activeDirective =
+      aiPromptDirective ||
+      (typeof localStorage !== "undefined" ? localStorage.getItem("storyzone_prompt_directive") : null);
+
+    let md = `# Стенограмма обсуждений & Принятые правки с ИИ-Соавтором\n`;
+    md += `## Книга: «${gameState.story.title}»\n\n`;
+    md += `*Экспортировано: ${formatDateTime(Date.now())} | Жанр: ${gameState.story.genre} | Вселенная: ${universe.universeName}*\n\n`;
+    md += `---\n\n`;
+
+    // Overview Stats
+    md += `### Сводка творческого сотрудничества\n`;
+    md += `- **Всего реплик и обсуждений в чате:** ${messages.length}\n`;
+    md += `- **Принятых предложений и правок соавтора:** ${acceptedEdits.length}\n`;
+    md += `- **Отредактированных автором глав повести:** ${editedChapters.length}\n`;
+    md += `- **Текущий стиль повести:** ${gameState.narrativeStyle || "Литературный"}\n`;
+    if (activeDirective) {
+      md += `- **Активная авторская директива:** «${activeDirective}»\n`;
+    }
+    md += `\n---\n\n`;
+
+    // Section 1: Accepted Edits & Proposals
+    md += `## 1. Реестр принятых правок и согласованных решений\n\n`;
+    if (acceptedEdits.length === 0) {
+      md += `*Пока не зафиксировано применённых правок через интерфейс предложений соавтора.*\n\n`;
+    } else {
+      acceptedEdits.forEach((edit, idx) => {
+        md += `### ${idx + 1}. [${edit.typeLabel}] ${edit.title}\n`;
+        md += `> **Дата и время:** ${formatDateTime(edit.timestamp)}\n`;
+        md += `> **Описание:** ${edit.description}\n`;
+        if (edit.payload) {
+          if (edit.payload.style) md += `> **Установленный стиль:** ${edit.payload.style}\n`;
+          if (edit.payload.length) md += `> **Объём генерации:** ${edit.payload.length}\n`;
+          if (edit.payload.directive) md += `> **Текст директивы:** «${edit.payload.directive}»\n`;
+          if (edit.payload.character) md += `> **Параметры персонажа:** ${edit.payload.character.name} (${edit.payload.character.role})\n`;
+          if (edit.payload.newSceneText) md += `> **Вставка в сцену:** «${edit.payload.newSceneText}»\n`;
+          if (edit.payload.actionLabel) md += `> **Воплощённое действие:** «${edit.payload.actionLabel}»\n`;
+          if (edit.payload.title && edit.payload.description) md += `> **Факт лорбука:** ${edit.payload.title} — ${edit.payload.description}\n`;
+        }
+        md += `\n`;
+      });
+    }
+
+    // Section 2: Manually edited chapters
+    if (editedChapters.length > 0) {
+      md += `## 2. Журнал глав с авторской редактурой текста\n\n`;
+      editedChapters.forEach((ch) => {
+        md += `### Эпизод #${ch.stepNumber}: ${ch.action}\n`;
+        md += `*(Текст был отредактирован автором и синхронизирован со стилем ИИ)*\n\n`;
+        md += `> ${ch.sceneText}\n\n`;
+      });
+      md += `---\n\n`;
+    }
+
+    // Section 3: Full transcript of discussions
+    md += `## 3. Полная стенограмма творческих бесед с ИИ-Соавтором\n\n`;
+    if (messages.length === 0) {
+      md += `*Диалог с соавтором пока не содержит сохранённых сообщений.*\n\n`;
+    } else {
+      messages.forEach((msg, idx) => {
+        const roleLabel = msg.role === "user" ? "👤 Автор" : msg.role === "assistant" ? "🤖 ИИ-Соавтор" : "⚙️ Система";
+        md += `#### Реплика #${idx + 1} — ${roleLabel} *(${formatDateTime(msg.timestamp)})*\n\n`;
+        md += `${msg.content}\n\n`;
+
+        if (msg.actionProposal) {
+          md += `> 📌 **Предложение соавтора:** ${msg.actionProposal.title}\n`;
+          md += `> *Статус:* ${msg.actionProposal.applied ? "✅ Принято автором и внедрено в повесть" : "⏳ Оставлено на рассмотрение"}\n`;
+          md += `> *Суть:* ${msg.actionProposal.description}\n\n`;
+        }
       });
     }
 
     return md;
   };
 
-  // Single chapter export
+  // 4. Single chapter export
   const generateSingleChapterText = () => {
     if (!gameState) return "";
-    return `ГЛАВА ${gameState.memoryChapters.length || 1}: ${gameState.story.title}\n\n${gameState.currentScene}\n\nДОСТУПНЫЕ ВЫБОРЫ:\n` +
+    const lastHistory = gameState.history?.[gameState.history.length - 1];
+    return `ГЛАВА ${gameState.memoryChapters?.length || 1}: ${gameState.story.title}\n` +
+      `Действие: «${lastHistory?.action || "Продолжение пути"}»\n\n` +
+      `${gameState.currentScene}\n\n` +
+      `ДОСТУПНЫЕ ВЫБОРЫ:\n` +
       gameState.currentChoices.map((c, i) => `${i + 1}. ${c.label} (${c.description || ""})`).join("\n");
   };
 
   const getCurrentExportString = () => {
     if (exportFormat === "json") return generateJsonExport();
     if (exportFormat === "markdown") return generateMarkdownBook();
+    if (exportFormat === "coauthor") return generateCoAuthorReport();
     return generateSingleChapterText();
   };
 
@@ -150,14 +443,22 @@ export const StoryExportImportModal: React.FC<StoryExportImportModalProps> = ({
   const handleDownload = () => {
     const text = getCurrentExportString();
     const isJson = exportFormat === "json";
-    const extension = isJson ? "json" : "md";
+    const extension = isJson ? "json" : exportFormat === "chapter" ? "txt" : "md";
     const mime = isJson ? "application/json" : "text/markdown";
     const blob = new Blob([text], { type: `${mime};charset=utf-8` });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
     const safeTitle = (gameState?.story.title || "story").replace(/\s+/g, "_");
-    link.download = `StoryZone_${safeTitle}_${exportFormat}.${extension}`;
+    const suffix =
+      exportFormat === "json"
+        ? "FullArchive"
+        : exportFormat === "markdown"
+        ? "BookChronicle"
+        : exportFormat === "coauthor"
+        ? "CoAuthorDiscussionsAndEdits"
+        : "Chapter";
+    link.download = `StoryZone_${safeTitle}_${suffix}.${extension}`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -175,12 +476,45 @@ export const StoryExportImportModal: React.FC<StoryExportImportModalProps> = ({
       try {
         const text = evt.target?.result as string;
         const parsed = JSON.parse(text);
+        let importedState: ActiveGameState | null = null;
+
         if (parsed.gameState) {
-          onImportGameState(parsed.gameState);
-          sound.playFanfare();
-          onClose();
+          importedState = { ...parsed.gameState };
         } else if (parsed.story && parsed.currentScene) {
-          onImportGameState(parsed);
+          importedState = { ...parsed };
+        }
+
+        if (importedState) {
+          const storyId = importedState.story?.id;
+
+          // Restore co-author chat messages
+          const chatHist =
+            parsed.coAuthorCollaboration?.chatMessages ||
+            parsed.coAuthorArchive?.fullChatTranscript ||
+            importedState.chatHistory ||
+            [];
+
+          if (Array.isArray(chatHist) && chatHist.length > 0 && storyId) {
+            try {
+              localStorage.setItem(`storyzone_chat_${storyId}`, JSON.stringify(chatHist));
+            } catch (e) {}
+            importedState.chatHistory = chatHist;
+          }
+
+          // Restore prompt directive
+          const promptDirective =
+            parsed.coAuthorCollaboration?.promptDirective ||
+            parsed.coAuthorArchive?.activePromptDirective ||
+            importedState.aiPromptDirective;
+
+          if (promptDirective) {
+            try {
+              localStorage.setItem("storyzone_prompt_directive", promptDirective);
+            } catch (e) {}
+            importedState.aiPromptDirective = promptDirective;
+          }
+
+          onImportGameState(importedState);
           sound.playFanfare();
           onClose();
         } else {
@@ -392,21 +726,47 @@ export const StoryExportImportModal: React.FC<StoryExportImportModalProps> = ({
           {activeTab === "export" ? (
             /* EXPORT TAB */
             <div className="space-y-5">
+              {/* Stats overview banner */}
+              <div className="flex flex-wrap items-center gap-2 px-4 py-2.5 rounded-xl bg-purple-950/40 border border-purple-800/40 text-xs">
+                <span className="font-semibold text-purple-200 flex items-center gap-1.5 mr-1">
+                  <Bot className="w-4 h-4 text-purple-400" />
+                  Готово к экспорту:
+                </span>
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-purple-900/60 text-purple-200 font-mono text-[11px]">
+                  <MessageSquare className="w-3 h-3 text-purple-300" />
+                  {currentChatHistory.length} обсуждений
+                </span>
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-950/80 border border-emerald-800/50 text-emerald-300 font-mono text-[11px]">
+                  <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                  {currentAcceptedEdits.length} принятых правок
+                </span>
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-neutral-900 text-neutral-300 font-mono text-[11px]">
+                  <BookOpen className="w-3 h-3 text-amber-400" />
+                  {gameState?.memoryChapters?.length || 1} глав
+                </span>
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-neutral-900 text-neutral-300 font-mono text-[11px]">
+                  <Users2 className="w-3 h-3 text-cyan-400" />
+                  {gameState?.characters?.length || 0} спутников
+                </span>
+              </div>
+
               {/* Format Switcher */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                 <button
                   onClick={() => setExportFormat("json")}
                   className={`p-3.5 rounded-xl border text-left flex items-start gap-3 transition-all ${
                     exportFormat === "json"
-                      ? "bg-purple-950/60 border-purple-600 text-purple-200 shadow-md"
-                      : "bg-neutral-900/60 border-neutral-800 text-neutral-400 hover:text-neutral-200"
+                      ? "bg-purple-950/70 border-purple-500 text-purple-200 shadow-md ring-1 ring-purple-500/40"
+                      : "bg-neutral-900/60 border-neutral-800 text-neutral-400 hover:text-neutral-200 hover:border-neutral-700"
                   }`}
                 >
                   <FileJson className="w-5 h-5 text-purple-400 shrink-0 mt-0.5" />
                   <div>
-                    <div className="font-semibold text-xs text-neutral-100">Полный дамп (JSON)</div>
+                    <div className="font-semibold text-xs text-neutral-100 flex items-center gap-1.5">
+                      <span>Полный архив (JSON)</span>
+                    </div>
                     <div className="text-[11px] opacity-75 mt-0.5">
-                      Все ветки, память глав, лорбук, инвентарь и статы
+                      Вся повесть, главы, статы + <strong>все обсуждения и принятые правки</strong>
                     </div>
                   </div>
                 </button>
@@ -415,15 +775,34 @@ export const StoryExportImportModal: React.FC<StoryExportImportModalProps> = ({
                   onClick={() => setExportFormat("markdown")}
                   className={`p-3.5 rounded-xl border text-left flex items-start gap-3 transition-all ${
                     exportFormat === "markdown"
-                      ? "bg-purple-950/60 border-purple-600 text-purple-200 shadow-md"
-                      : "bg-neutral-900/60 border-neutral-800 text-neutral-400 hover:text-neutral-200"
+                      ? "bg-purple-950/70 border-purple-500 text-purple-200 shadow-md ring-1 ring-purple-500/40"
+                      : "bg-neutral-900/60 border-neutral-800 text-neutral-400 hover:text-neutral-200 hover:border-neutral-700"
                   }`}
                 >
                   <BookOpen className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
                   <div>
-                    <div className="font-semibold text-xs text-neutral-100">Книга / Роман (MD)</div>
+                    <div className="font-semibold text-xs text-neutral-100">Книга & Роман (MD)</div>
                     <div className="text-[11px] opacity-75 mt-0.5">
-                      Красиво оформленный текст всей истории для чтения
+                      Художественный текст всей истории с главами, выборами и стенограммой
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  onClick={() => setExportFormat("coauthor")}
+                  className={`p-3.5 rounded-xl border text-left flex items-start gap-3 transition-all ${
+                    exportFormat === "coauthor"
+                      ? "bg-purple-950/70 border-purple-500 text-purple-200 shadow-md ring-1 ring-purple-500/40"
+                      : "bg-neutral-900/60 border-neutral-800 text-neutral-400 hover:text-neutral-200 hover:border-neutral-700"
+                  }`}
+                >
+                  <Bot className="w-5 h-5 text-cyan-400 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-semibold text-xs text-neutral-100 flex items-center gap-1">
+                      <span>Диалоги соавтора</span>
+                    </div>
+                    <div className="text-[11px] opacity-75 mt-0.5">
+                      Отдельная стенограмма бесед с соавтором и реестр согласованных правок
                     </div>
                   </div>
                 </button>
@@ -432,19 +811,56 @@ export const StoryExportImportModal: React.FC<StoryExportImportModalProps> = ({
                   onClick={() => setExportFormat("chapter")}
                   className={`p-3.5 rounded-xl border text-left flex items-start gap-3 transition-all ${
                     exportFormat === "chapter"
-                      ? "bg-purple-950/60 border-purple-600 text-purple-200 shadow-md"
-                      : "bg-neutral-900/60 border-neutral-800 text-neutral-400 hover:text-neutral-200"
+                      ? "bg-purple-950/70 border-purple-500 text-purple-200 shadow-md ring-1 ring-purple-500/40"
+                      : "bg-neutral-900/60 border-neutral-800 text-neutral-400 hover:text-neutral-200 hover:border-neutral-700"
                   }`}
                 >
                   <FileText className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
                   <div>
                     <div className="font-semibold text-xs text-neutral-100">Текущая глава</div>
                     <div className="text-[11px] opacity-75 mt-0.5">
-                      Текст только текущей сцены и доступные выборы
+                      Текст только текущей сцены, действие и доступные выборы
                     </div>
                   </div>
                 </button>
               </div>
+
+              {/* Toggles for Markdown and Co-Author exports */}
+              {(exportFormat === "markdown" || exportFormat === "coauthor") && (
+                <div className="flex flex-wrap items-center gap-4 p-3 rounded-xl bg-neutral-900/80 border border-neutral-800 text-xs">
+                  <span className="text-neutral-400 font-semibold flex items-center gap-1.5">
+                    <Sliders className="w-3.5 h-3.5 text-purple-400" />
+                    Настройки экспорта:
+                  </span>
+                  <label className="flex items-center gap-1.5 cursor-pointer text-neutral-200 hover:text-white">
+                    <input
+                      type="checkbox"
+                      checked={includeChat}
+                      onChange={(e) => setIncludeChat(e.target.checked)}
+                      className="rounded border-neutral-700 text-purple-600 focus:ring-purple-500"
+                    />
+                    <span>Стенограмма обсуждений ({currentChatHistory.length})</span>
+                  </label>
+                  <label className="flex items-center gap-1.5 cursor-pointer text-neutral-200 hover:text-white">
+                    <input
+                      type="checkbox"
+                      checked={includeAcceptedEdits}
+                      onChange={(e) => setIncludeAcceptedEdits(e.target.checked)}
+                      className="rounded border-neutral-700 text-purple-600 focus:ring-purple-500"
+                    />
+                    <span>Реестр принятых правок ({currentAcceptedEdits.length})</span>
+                  </label>
+                  <label className="flex items-center gap-1.5 cursor-pointer text-neutral-200 hover:text-white">
+                    <input
+                      type="checkbox"
+                      checked={includeLore}
+                      onChange={(e) => setIncludeLore(e.target.checked)}
+                      className="rounded border-neutral-700 text-purple-600 focus:ring-purple-500"
+                    />
+                    <span>Досье спутников и лорбук</span>
+                  </label>
+                </div>
+              )}
 
               {/* Actions & Preview */}
               <div className="space-y-3">

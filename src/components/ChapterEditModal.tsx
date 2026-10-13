@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { sound } from "../utils/audio";
 import { safeFetchJson } from "../utils/safeApi";
-import { StoryChoice } from "../types";
+import { StoryChoice, CoAuthorAgreement } from "../types";
 import { extractAuthorStyleHeuristic } from "../utils/styleAnalyzer";
 
 interface ChapterEditModalProps {
@@ -25,6 +25,7 @@ interface ChapterEditModalProps {
   storyTitle: string;
   customApiKey?: string;
   currentChoices?: StoryChoice[];
+  coAuthorAgreements?: CoAuthorAgreement[];
   onSaveChapter: (
     editedText: string,
     updatedSummary?: string,
@@ -51,6 +52,7 @@ export const ChapterEditModal: React.FC<ChapterEditModalProps> = ({
   storyTitle,
   customApiKey,
   currentChoices,
+  coAuthorAgreements,
   onSaveChapter,
 }) => {
   const [editedText, setEditedText] = useState(originalText);
@@ -148,6 +150,7 @@ export const ChapterEditModal: React.FC<ChapterEditModalProps> = ({
           currentChoices: adaptChoices ? currentChoices : undefined,
           generateNextStep: autoAdvanceNextStep,
           customKey: customApiKey,
+          coAuthorAgreements: coAuthorAgreements || [],
         }),
       });
 

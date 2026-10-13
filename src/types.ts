@@ -100,6 +100,31 @@ export interface Character {
   currentStatus?: string;      // Текущее занятие, миссия или состояние в отряде
   allegiance?: string;         // Фракция, орден, клан или верность
   fandomArchetypeNotes?: string; // Синтез канона/фанфиков/обзоров со всего мира
+  // Voice, Appearance & Pose Multimedia
+  voiceSampleUrl?: string;       // Загруженное аудио голоса персонажа или ссылка
+  voiceTimbre?: string;          // Тембр: "Низкий бархатный баритон", "Звонкий насмешливый альт", "Хриплый шёпот"
+  voicePitch?: number;           // Высота голоса (0.5 - 1.8) для речевого синтезатора
+  voiceRate?: number;            // Скорость речи (0.7 - 1.4)
+  appearancePhotos?: string[];   // Галерея фото внешности, костюмов, артов персонажа
+  poseReferenceUrl?: string;     // Фото текущей позы или сцены персонажа
+  poseDescription?: string;      // Описание позы: "Скрестив руки, опираясь на колонну"
+}
+
+export type AttachmentCategory = "photo" | "audio" | "video" | "text_doc";
+
+export interface MediaAttachment {
+  id: string;
+  name: string;
+  category: AttachmentCategory;
+  fileType: string;              // "image/png", "audio/mp3", "video/mp4", "text/plain", "application/json", etc.
+  size: number;
+  dataUrl?: string;              // base64 / blob / external URL
+  textPreview?: string;          // Предпросмотр текста (.txt, .md, .docx, .json, .fountain)
+  duration?: number;             // Длительность аудио/видео в сек
+  analysisSummary?: string;      // Выжимка ИИ (описание позы, освещения, тембра голоса, музыки)
+  assignedCharacterId?: string;  // Привязка к конкретному персонажу
+  usageTarget?: "scene_detail" | "character_voice" | "character_appearance" | "character_pose" | "story_script" | "lorebook" | "background_ost";
+  timestamp: number;
 }
 
 export interface PlayerStats {
@@ -152,6 +177,7 @@ export interface StoryMemoryChapter {
   keyFacts: string[];
   characterInteractions?: string[];
   timestamp: number;
+  chosenAction?: string; // Действие или выбор игрока, приведший к этой главе
 }
 
 // Lorebook knowledge entry
@@ -203,6 +229,11 @@ export interface Story {
   povCompanionName?: string;
   lorebook?: LorebookEntry[];
   universeSetting?: UniverseSetting;
+  coAuthorAgreements?: CoAuthorAgreement[];
+  authorDictateMode?: boolean;
+  strictActionFidelity?: boolean;
+  proportionalActionScaling?: boolean;
+  coAuthorMode?: boolean;
 }
 
 export interface SaveSlot {
@@ -226,6 +257,29 @@ export interface SaveSlot {
   narrativeStyle?: NarrativeStyle;
   narrativePOV?: NarrativePOV;
   universeSetting?: UniverseSetting;
+  chatHistory?: StoryChatMessage[];
+  aiPromptDirective?: string;
+  divergenceLog?: { step: number; title: string; divergenceType: string; timestamp: number }[];
+  attachedMedia?: MediaAttachment[];
+  coAuthorAgreements?: CoAuthorAgreement[];
+  authorDictateMode?: boolean;
+  strictActionFidelity?: boolean;
+  proportionalActionScaling?: boolean;
+  coAuthorMode?: boolean;
+}
+
+export interface CoAuthorAgreement {
+  id: string;
+  title: string;
+  content: string;
+  category?: "plot_rule" | "character_trait" | "world_fact" | "style_note";
+  timestamp: number;
+}
+
+export interface PendingStoryStep {
+  actionLabel: string;
+  response: any;
+  timestamp: number;
 }
 
 export interface ActiveGameState {
@@ -267,6 +321,15 @@ export interface ActiveGameState {
   chatHistory?: StoryChatMessage[];
   universeSetting?: UniverseSetting;
   lastGroundingSources?: GroundingSource[];
+  aiPromptDirective?: string;
+  narrativeContextSummary?: string;
+  attachedMedia?: MediaAttachment[];
+  coAuthorAgreements?: CoAuthorAgreement[];
+  authorDictateMode?: boolean;
+  strictActionFidelity?: boolean;
+  proportionalActionScaling?: boolean;
+  coAuthorMode?: boolean;
+  pendingStep?: PendingStoryStep | null;
 }
 
 export type StoryChatActionType =
@@ -279,7 +342,8 @@ export type StoryChatActionType =
   | "execute_action"
   | "update_directive"
   | "update_universe"
-  | "add_lore_fact";
+  | "add_lore_fact"
+  | "accept_plot";
 
 export interface StoryChatActionProposal {
   type: StoryChatActionType;
@@ -297,6 +361,7 @@ export interface StoryChatMessage {
   actionProposal?: StoryChatActionProposal;
   groundingSources?: GroundingSource[];
   searchQueries?: string[];
+  attachedMedia?: MediaAttachment[];
 }
 
 export type MusicRhythmPreset = "meditative" | "narrative" | "march" | "adrenaline" | "custom";
@@ -389,3 +454,136 @@ export interface StyleAnalysisResult {
   actionableTips: string[];
   improvedVersion: string;
 }
+
+// 1. Narrative Continuity & Character Consistency Context
+export interface NarrativeContextSummary {
+  activeTension: string;          // Непосредственный конфликт и ставки текущей сцены
+  companionPsychology: string;    // Психологическое состояние каждого спутника, доверие, обиды
+  causalChain: string;            // Неразрывная цепочка предыдущих шагов и последствий
+  environmentalReality: string;   // Окружение, ранения, предметы в руках, освещение
+  unresolvedThreads: string;      // Открытые обещания, ожидаемые угрозы
+  generatedAtStep: number;
+  rawText?: string;
+}
+
+// 2. Cross-Device Cloud Sync & Account
+export interface CloudSyncAccount {
+  accountKey: string;             // Email or custom sync code
+  shortCode: string;              // Easy 6-character mobile PIN
+  lastSyncedAt: number;
+  storiesCount: number;
+}
+
+export interface CloudSyncStoryPayload {
+  accountKey: string;
+  storyId: string;
+  storyTitle: string;
+  storyGenre: string;
+  gameState: ActiveGameState;
+  saves?: SaveSlot[];
+  chatHistory?: StoryChatMessage[];
+  syncedAt: number;
+  deviceType?: string;
+}
+
+// 3. Co-Author Scenario Formats & Multimedia Reference
+export type ScenarioFormatType =
+  | "screenplay"        // Киносценарий (Голливудский / Режиссерский формат)
+  | "stage_play"        // Театральная пьеса и полифонический диалог
+  | "light_novel"       // Ранобэ / Японская новелла (внутренний монолог)
+  | "rpg_dialogue_tree" // RPG-квест (ветвящиеся реплики в стиле Witcher 3 / BG3)
+  | "combat_choreography" // Пошаговая боевая хореография и трюки
+  | "sensory_vignette"; // Сенсорная атмосферная зарисовка (5 чувств)
+
+export interface ScenarioExample {
+  id: ScenarioFormatType;
+  title: string;
+  badge: string;
+  description: string;
+  iconName: string;
+  formatGuide: string;
+  sampleSceneText: string;
+  coAuthorPromptPrompt: string;
+}
+
+export interface UniverseReferenceLink {
+  title: string;
+  url: string;
+  sourceType: "wiki" | "tvtropes" | "lore_bible" | "script" | "encyclopedia";
+  description: string;
+  universeName: string;
+}
+
+export interface MultimediaReferenceItem {
+  id: string;
+  category: "visual_photo" | "cinematic_video" | "audio_soundscape";
+  title: string;
+  description: string;
+  assetUrl?: string;
+  directorNotes: string;
+  injectedDetailProposal: string;
+}
+
+export interface UserAccountProfile {
+  id: string;
+  username: string;
+  email: string;
+  pinCode: string;
+  createdAt: number;
+  lastSyncedAt: number;
+  devices?: { deviceId: string; deviceName: string; lastSeen: number }[];
+}
+
+export interface AccountDataSnapshot {
+  activeGameState: ActiveGameState | null;
+  saves: SaveSlot[];
+  customStories: Story[];
+  chatHistories?: Record<string, StoryChatMessage[]>;
+  settings?: {
+    readerTheme?: ReaderTheme;
+    fontSize?: "sm" | "md" | "lg" | "xl";
+    soundEnabled?: boolean;
+    autoSituationMusic?: boolean;
+    aiPromptDirective?: string;
+    aiSystemPrompt?: string;
+    ultraMemory?: boolean;
+    customApiKey?: string;
+  };
+  syncedAt: number;
+  stepCount?: number;
+  storyTitle?: string;
+}
+
+export type WorldMapMode = "canon" | "past" | "future" | "unified";
+
+export interface WorldMapLocation {
+  id: string;
+  name: string;
+  description: string;
+  category: "capital" | "city" | "region" | "dungeon" | "wilds" | "landmark" | "sanctuary";
+  region?: string;
+  dangerLevel: 1 | 2 | 3 | 4 | 5;
+  loreSnippet?: string;
+  visitedSteps: number[];
+  isCurrentLocation: boolean;
+  isPastVisited: boolean;
+  isFutureChoice: boolean;
+  choiceLabel?: string;
+  charactersHere: string[];
+  source: "lorebook" | "universe_setting" | "chapter_history" | "choice" | "canon";
+  coordinates?: { x: number; y: number };
+  x?: number;
+  y?: number;
+  fx?: number | null;
+  fy?: number | null;
+}
+
+export interface WorldMapConnection {
+  id: string;
+  source: string | any;
+  target: string | any;
+  type: "road" | "trail" | "border" | "journey_past" | "future_choice" | "sea_route";
+  name?: string;
+  danger?: number;
+}
+
